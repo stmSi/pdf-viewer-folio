@@ -1,0 +1,132 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Folio PDF Viewer</title>
+<style>
+  :root { font-family: system-ui, sans-serif; color-scheme: light dark; }
+  html, body { margin: 0; width: 100%; height: 100%; overflow: hidden; }
+  body { background: #e8ebf0; }
+  canvas { display: block; width: 100% !important; height: 100% !important; touch-action: none; outline: none; }
+  #loading {
+    position: fixed; left: 50%; top: 50%; transform: translate(-50%, -50%);
+    background: #fcfdff; color: #1d2535; border: 1px solid #d7dee8; border-radius: 10px;
+    padding: 12px 18px; margin: 0; max-width: calc(100% - 48px);
+    font-size: 14px; text-align: center;
+  }
+  dialog { border: 1px solid #a4aebf; border-radius: 12px; max-width: calc(100% - 48px); padding: 18px; }
+  dialog::backdrop { background: rgb(0 0 0 / 32%); }
+  #text-label { display: block; font-weight: 600; }
+  #text-field { margin: 12px 0 16px; width: 100%; box-sizing: border-box; }
+  input, button { font: inherit; padding: 8px 10px; }
+  .actions { display: flex; gap: 8px; justify-content: flex-end; }
+</style>
+</head>
+<body>
+<canvas id="canvas" tabindex="0" aria-label="Folio PDF Viewer"></canvas>
+<input id="pdf-file" type="file" accept=".pdf,application/pdf" hidden>
+<p id="loading" role="status">Loading Folio…</p>
+<dialog id="text-dialog">
+  <form method="dialog">
+    <label id="text-label" for="text-field"></label>
+    <input id="text-field" autocomplete="off" maxlength="255">
+    <div class="actions">
+      <button value="cancel" type="button" id="text-cancel">Cancel</button>
+      <button value="ok" type="submit">OK</button>
+    </div>
+  </form>
+</dialog>
+<script>
+  const canvas = document.getElementById("canvas");
+  const picker = document.getElementById("pdf-file");
+  const status = document.getElementById("loading");
+  const dialog = document.getElementById("text-dialog");
+  const textField = document.getElementById("text-field");
+  const fileRefs = new Map();
+  const tabId = Math.random().toString(36).slice(2);
+  let sequence = 0;
+  var Module = {
+    canvas,
+    folioReopen(locator) {
+      const file = fileRefs.get(locator);
+      if (!file) return false;
+      void openFile(file, locator);
+      return true;
+    },
+    onRuntimeInitialized() {
+      status.hidden = true;
+      canvas.focus();
+    },
+    onAbort() {
+      status.textContent = "Folio couldn’t start. Try reloading the page.";
+      status.hidden = false;
+    }
+  };
+
+  async function openFile(file, existingLocator) {
+    if (!file || !Module.folioWrite) return;
+    const id = ++sequence;
+    const locator = existingLocator ?? `${tabId}-${id}`;
+    status.textContent = "Opening PDF…";
+    status.hidden = false;
+    try {
+      const data = new Uint8Array(await file.arrayBuffer());
+      if (id === sequence) {
+        fileRefs.delete(locator);
+        fileRefs.set(locator, file);
+        if (fileRefs.size > 20) fileRefs.delete(fileRefs.keys().next().value);
+        Module.folioWrite(`/selected-${id}.pdf`, data, file.name, locator);
+      }
+    } catch (error) {
+      if (id === sequence) Module.ccall("folio_web_file", null, ["string", "string", "string", "string"],
+                                        ["", "", "Could not read the selected PDF.", ""]);
+    } finally {
+      if (id === sequence) status.hidden = true;
+      canvas.focus();
+    }
+  }
+
+  picker.addEventListener("change", () => {
+    const file = picker.files[0];
+    picker.value = "";
+    void openFile(file);
+  });
+  picker.addEventListener("cancel", () =>
+    Module.ccall("folio_web_file", null, ["string", "string", "string", "string"], ["", "", "", ""]));
+  canvas.addEventListener("contextmenu", event => event.preventDefault());
+  canvas.addEventListener("dragover", event => event.preventDefault());
+  canvas.addEventListener("drop", event => {
+    event.preventDefault();
+    void openFile(event.dataTransfer.files[0]);
+  });
+  dialog.addEventListener("close", () => {
+    const accepted = dialog.returnValue === "ok";
+    Module.ccall("folio_web_text", null, ["string", "number"],
+                 [accepted ? textField.value : "", Number(accepted)]);
+    textField.value = "";
+    canvas.focus();
+  });
+  document.getElementById("text-cancel").addEventListener("click", () => dialog.close("cancel"));
+  function handleDialogKey(event) {
+    if (!dialog.open) return;
+    event.stopImmediatePropagation();
+    if (event.type !== "keydown" || event.isComposing) return;
+    if (event.key === "Escape") {
+      event.preventDefault();
+      dialog.close("cancel");
+    } else if (event.key === "Enter" && event.target === textField) {
+      event.preventDefault();
+      dialog.close("ok");
+    }
+  }
+  for (const event of ["keydown", "keyup", "keypress"])
+    window.addEventListener(event, handleDialogKey, true);
+  window.addEventListener("pagehide", () => Module._folio_save_session?.());
+  document.addEventListener("visibilitychange", () => {
+    if (document.hidden) Module._folio_save_session?.();
+  });
+</script>
+{{{ SCRIPT }}}
+</body>
+</html>
