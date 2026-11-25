@@ -17,6 +17,8 @@ struct Pdf {
     uint64_t key;
     int pages;
     bool locked;
+    bool copy_allowed, print_allowed;
+    fz_cookie cookie;
 };
 
 static uint64_t hash_chunk(uint64_t hash, const unsigned char *bytes, size_t count)
@@ -75,6 +77,8 @@ Pdf *pdf_open(const char *path, char *error, int error_size)
         if (!pdf->locked) {
             pdf->pages = fz_count_pages(context, pdf->document);
             if (pdf->pages <= 0) fz_throw(context, FZ_ERROR_FORMAT, "This PDF has no pages.");
+            pdf->copy_allowed = fz_has_permission(context, pdf->document, FZ_PERMISSION_COPY);
+            pdf->print_allowed = fz_has_permission(context, pdf->document, FZ_PERMISSION_PRINT);
         }
     }
     fz_always(context) {
@@ -110,6 +114,8 @@ bool pdf_unlock(Pdf *pdf, const char *password, char *error, int error_size)
         pdf->pages = fz_count_pages(context, pdf->document);
         if (pdf->pages <= 0) fz_throw(context, FZ_ERROR_FORMAT, "This PDF has no pages.");
         pdf->locked = false;
+        pdf->copy_allowed = fz_has_permission(context, pdf->document, FZ_PERMISSION_COPY);
+        pdf->print_allowed = fz_has_permission(context, pdf->document, FZ_PERMISSION_PRINT);
     }
     fz_catch(context) {
         report(error, error_size, fz_caught_message(context));
@@ -142,7 +148,7 @@ bool pdf_render(Pdf *pdf, float scale, PixelBox pixels, PdfImage *image,
         fz_clear_pixmap_with_value(context, pixmap, 255);
         device = fz_new_draw_device(context, fz_identity, pixmap);
         fz_run_display_list(context, pdf->page, device, fz_scale(scale, scale),
-                            fz_rect_from_irect(box), NULL);
+                            fz_rect_from_irect(box), &pdf->cookie);
         fz_close_device(context, device);
         size_t row_bytes = (size_t)width * 3;
         image->pixels = malloc(row_bytes * (size_t)height);
@@ -248,13 +254,25 @@ bool pdf_set_page(Pdf *pdf, int index, char *error, int error_size)
     if (pdf->page != NULL && pdf->page_index == index) return true;
     fz_context *context = pdf->context;
     fz_display_list *new_page = NULL;
+    fz_page *loaded_page = NULL;
+    fz_device *device = NULL;
     fz_rect bounds;
     fz_var(new_page);
+    fz_var(loaded_page);
+    fz_var(device);
     fz_try(context) {
-        new_page = fz_new_display_list_from_page_number(context, pdf->document, index);
-        bounds = fz_bound_display_list(context, new_page);
+        loaded_page = fz_load_page(context, pdf->document, index);
+        bounds = fz_bound_page(context, loaded_page);
         if (!valid_bounds(bounds))
             fz_throw(context, FZ_ERROR_FORMAT, "Unsupported PDF page dimensions.");
+        new_page = fz_new_display_list(context, bounds);
+        device = fz_new_list_device(context, new_page);
+        fz_run_page(context, loaded_page, device, fz_identity, &pdf->cookie);
+        fz_close_device(context, device);
+    }
+    fz_always(context) {
+        fz_drop_device(context, device);
+        fz_drop_page(context, loaded_page);
     }
     fz_catch(context) {
         fz_drop_display_list(context, new_page);
@@ -352,4 +370,217 @@ void pdf_free_contents(PdfContents *contents)
 {
     free(contents->entries);
     *contents = (PdfContents){0};
+}
+
+bool pdf_can_copy(const Pdf *pdf) { return pdf != NULL && pdf->copy_allowed; }
+bool pdf_can_print(const Pdf *pdf) { return pdf != NULL && pdf->print_allowed; }
+void pdf_interrupt(Pdf *pdf) { if (pdf != NULL) pdf->cookie.abort = 1; }
+void pdf_reset_interrupt(Pdf *pdf) { if (pdf != NULL) pdf->cookie = (fz_cookie){0}; }
+
+void pdf_text_free(PdfText *text)
+{
+    if (text == NULL) return;
+    for (size_t i = 0; i < text->link_count; i++) free(text->links[i].uri);
+    free(text->links);
+    free(text->glyphs);
+    free(text->text);
+    free(text);
+}
+
+char *pdf_copy_text(const PdfText *text, size_t first, size_t last)
+{
+    if (text == NULL || text->count == 0) return NULL;
+    if (first > last) { size_t swap = first; first = last; last = swap; }
+    if (first >= text->count) return NULL;
+    if (last >= text->count) last = text->count - 1;
+    if (last - first > (SIZE_MAX - 2) / 5) return NULL;
+    char *value = malloc((last - first + 1) * 5 + 2);
+    if (value == NULL) return NULL;
+    size_t used = 0;
+    int line = text->glyphs[first].line;
+    for (size_t i = first; i <= last; i++) {
+        if (text->glyphs[i].line != line) value[used++] = '\n';
+        line = text->glyphs[i].line;
+        int codepoint = text->glyphs[i].codepoint;
+        if (codepoint < 0 || codepoint > 0x10ffff) codepoint = 0xfffd;
+        used += (size_t)fz_runetochar(value + used, codepoint);
+    }
+    value[used] = '\0';
+    return value;
+}
+
+static fz_stext_page *structured_text(Pdf *pdf)
+{
+    fz_context *ctx = pdf->context;
+    fz_stext_page *text = NULL;
+    fz_device *device = NULL;
+    fz_var(text);
+    fz_var(device);
+    fz_try(ctx) {
+        fz_stext_options options = {0};
+        options.flags = FZ_STEXT_PRESERVE_WHITESPACE;
+        text = fz_new_stext_page(ctx, fz_bound_display_list(ctx, pdf->page));
+        device = fz_new_stext_device(ctx, text, &options);
+        fz_run_display_list(ctx, pdf->page, device, fz_identity, fz_infinite_rect, &pdf->cookie);
+        fz_close_device(ctx, device);
+    }
+    fz_always(ctx) { fz_drop_device(ctx, device); }
+    fz_catch(ctx) { fz_drop_stext_page(ctx, text); fz_rethrow(ctx); }
+    return text;
+}
+
+bool pdf_extract_text(Pdf *pdf, int page_index, PdfText **output, char *error, int error_size)
+{
+    *output = NULL;
+    if (!pdf_set_page(pdf, page_index, error, error_size)) return false;
+    fz_context *ctx = pdf->context;
+    PdfText *result = calloc(1, sizeof *result);
+    if (result == NULL) { report(error, error_size, "Out of memory reading text."); return false; }
+    fz_stext_page *page = NULL;
+    fz_page *native_page = NULL;
+    fz_link *links = NULL;
+    fz_var(page); fz_var(native_page); fz_var(links);
+    fz_try(ctx) {
+        page = structured_text(pdf);
+        size_t count = 0;
+        for (fz_stext_block *b = page->first_block; b != NULL; b = b->next) {
+            if (b->type != FZ_STEXT_BLOCK_TEXT) continue;
+            for (fz_stext_line *l = b->u.t.first_line; l != NULL; l = l->next)
+                for (fz_stext_char *c = l->first_char; c != NULL; c = c->next)
+                    if (++count > 500000) fz_throw(ctx, FZ_ERROR_LIMIT, "This page contains too much selectable text.");
+        }
+        if (count > 0) {
+            result->glyphs = calloc(count, sizeof *result->glyphs);
+            if (result->glyphs == NULL) fz_throw(ctx, FZ_ERROR_SYSTEM, "Out of memory reading text.");
+            int line = 0;
+            for (fz_stext_block *b = page->first_block; b != NULL; b = b->next) {
+                if (b->type != FZ_STEXT_BLOCK_TEXT) continue;
+                for (fz_stext_line *l = b->u.t.first_line; l != NULL; l = l->next, line++) {
+                    for (fz_stext_char *c = l->first_char; c != NULL; c = c->next) {
+                        fz_rect box = fz_rect_from_quad(c->quad);
+                        result->glyphs[result->count++] = (PdfGlyph){
+                            {box.x0, box.y0, box.x1, box.y1}, c->c, line};
+                    }
+                }
+            }
+            result->text = pdf_copy_text(result, 0, count - 1);
+            if (result->text == NULL) fz_throw(ctx, FZ_ERROR_SYSTEM, "Out of memory reading text.");
+        } else {
+            result->text = calloc(1, 1);
+            if (result->text == NULL) fz_throw(ctx, FZ_ERROR_SYSTEM, "Out of memory reading text.");
+        }
+        native_page = fz_load_page(ctx, pdf->document, page_index);
+        links = fz_load_links(ctx, native_page);
+        size_t link_count = 0;
+        for (fz_link *link = links; link != NULL; link = link->next)
+            if (++link_count > 10000) fz_throw(ctx, FZ_ERROR_LIMIT, "This page contains too many links.");
+        if (link_count > 0) {
+            result->links = calloc(link_count, sizeof *result->links);
+            if (result->links == NULL) fz_throw(ctx, FZ_ERROR_SYSTEM, "Out of memory reading links.");
+        }
+        for (fz_link *link = links; link != NULL; link = link->next) {
+            PdfLink *item = &result->links[result->link_count++];
+            item->box = (PdfBox){link->rect.x0, link->rect.y0, link->rect.x1, link->rect.y1};
+            item->page = -1;
+            item->x = item->y = NAN;
+            const char *uri = link->uri != NULL ? link->uri : "";
+            item->uri = malloc(strlen(uri) + 1);
+            if (item->uri == NULL) fz_throw(ctx, FZ_ERROR_SYSTEM, "Out of memory reading links.");
+            strcpy(item->uri, uri);
+            if (*uri != '\0' && !fz_is_external_link(ctx, uri)) {
+                fz_location destination = fz_resolve_link(ctx, pdf->document, uri, &item->x, &item->y);
+                if (destination.chapter >= 0 && destination.page >= 0) {
+                    int target = fz_page_number_from_location(ctx, pdf->document, destination);
+                    if (target >= 0 && target < pdf->pages) item->page = target;
+                }
+            }
+        }
+    }
+    fz_always(ctx) {
+        fz_drop_link(ctx, links);
+        fz_drop_page(ctx, native_page);
+        fz_drop_stext_page(ctx, page);
+    }
+    fz_catch(ctx) {
+        report(error, error_size, fz_caught_message(ctx));
+        pdf_text_free(result);
+        return false;
+    }
+    *output = result;
+    return true;
+}
+
+typedef struct { PdfSearchCallback callback; void *data; } SearchAdapter;
+static int search_callback(fz_context *ctx, void *opaque, int count, fz_quad *quads)
+{
+    SearchAdapter *adapter = opaque;
+    PdfBox *boxes = fz_malloc_array(ctx, count, PdfBox);
+    int stopped = 0;
+    fz_try(ctx) {
+        for (int i = 0; i < count; i++) {
+            fz_rect box = fz_rect_from_quad(quads[i]);
+            boxes[i] = (PdfBox){box.x0, box.y0, box.x1, box.y1};
+        }
+        stopped = !adapter->callback(boxes, (size_t)count, adapter->data);
+    }
+    fz_always(ctx) { fz_free(ctx, boxes); }
+    fz_catch(ctx) { fz_rethrow(ctx); }
+    return stopped;
+}
+
+int pdf_search_page(Pdf *pdf, int page_index, const char *query, PdfSearchCallback callback,
+                    void *data, char *error, int error_size)
+{
+    if (query == NULL || *query == '\0') return 0;
+    if (!pdf_set_page(pdf, page_index, error, error_size)) return -1;
+    fz_context *ctx = pdf->context;
+    fz_stext_page *page = NULL;
+    int count = 0;
+    fz_var(page);
+    fz_try(ctx) {
+        page = structured_text(pdf);
+        SearchAdapter adapter = {callback, data};
+        count = fz_search_stext_page_cb(ctx, page, query, search_callback, &adapter);
+    }
+    fz_always(ctx) { fz_drop_stext_page(ctx, page); }
+    fz_catch(ctx) { report(error, error_size, fz_caught_message(ctx)); return -1; }
+    return count;
+}
+
+bool pdf_print_pages(const char *path,const char *password,const int *pages,size_t count,
+                     const char *destination,PdfCancelCallback cancel,void *data,char *error,int error_size)
+{
+    Pdf *source=pdf_open(path,error,error_size);
+    if(!source) return false;
+    if(pdf_locked(source)&&!pdf_unlock(source,password,error,error_size)) {pdf_close(source);return false;}
+    if(!pdf_can_print(source)) {report(error,error_size,"This PDF does not allow printing.");pdf_close(source);return false;}
+    fz_context *ctx=source->context;
+    fz_document_writer *output=NULL;
+    pdf_page *page=NULL;
+    bool ok=false;
+    fz_var(output);fz_var(page);fz_var(ok);
+    fz_try(ctx) {
+        if(count==0) fz_throw(ctx,FZ_ERROR_ARGUMENT,"No pages selected for printing.");
+        output=fz_new_pdf_writer(ctx,destination,"compress=yes,garbage=compact");
+        for(size_t i=0;i<count;i++) {
+            if(cancel&&cancel(data)) fz_throw(ctx,FZ_ERROR_ABORT,"Printing canceled.");
+            if(pages[i]<0||pages[i]>=source->pages) fz_throw(ctx,FZ_ERROR_ARGUMENT,"Invalid print page range.");
+            page=pdf_load_page(ctx,pdf_specifics(ctx,source->document),pages[i]);
+            fz_rect bounds=fz_bound_page(ctx,(fz_page *)page);
+            fz_matrix transform=fz_translate(-bounds.x0,-bounds.y0);
+            fz_device *device=fz_begin_page(ctx,output,fz_transform_rect(bounds,transform));
+            // Re-emit vectors with print visibility rules, including existing
+            // annotation and form appearances. Page grafting omits those.
+            pdf_run_page_with_usage(ctx,page,device,transform,"Print",NULL);
+            fz_end_page(ctx,output);
+            fz_drop_page(ctx,(fz_page *)page);page=NULL;
+        }
+        if(cancel&&cancel(data)) fz_throw(ctx,FZ_ERROR_ABORT,"Printing canceled.");
+        fz_close_document_writer(ctx,output);
+        ok=true;
+    }
+    fz_always(ctx) {fz_drop_page(ctx,(fz_page *)page);fz_drop_document_writer(ctx,output);}
+    fz_catch(ctx) {report(error,error_size,fz_caught_message(ctx));}
+    pdf_close(source);
+    return ok;
 }

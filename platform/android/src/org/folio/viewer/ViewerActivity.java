@@ -1,6 +1,20 @@
 package org.folio.viewer;
 
 import android.app.AlertDialog;
+import android.content.ClipData;
+import android.content.ClipboardManager;
+import android.content.Context;
+import android.os.CancellationSignal;
+import android.os.ParcelFileDescriptor;
+import android.print.PageRange;
+import android.print.PrintAttributes;
+import android.print.PrintDocumentAdapter;
+import android.print.PrintDocumentInfo;
+import android.print.PrintManager;
+import android.view.ViewGroup;
+import org.json.JSONObject;
+import java.io.OutputStream;
+import java.util.ArrayList;
 import android.app.NativeActivity;
 import android.content.ActivityNotFoundException;
 import android.content.Intent;
@@ -22,7 +36,9 @@ import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 
 public final class ViewerActivity extends NativeActivity {
-    private static final int OPEN_PDF = 21;
+    private static final int OPEN_PDF = 21, SAVE_PDF = 22;
+    private ReaderAccessibilityView readerAccessibility;
+    private File exportCopy;
     private final ExecutorService files = Executors.newSingleThreadExecutor();
     private boolean pickerOpen;
 
@@ -32,6 +48,10 @@ public final class ViewerActivity extends NativeActivity {
 
     private static native void deliverFile(byte[] path, byte[] name, byte[] error, byte[] locator);
     private static native void deliverText(byte[] value, boolean accepted);
+    private static native void deliverNotice(byte[] message);
+    private static native void deliverCommand(int command, int element);
+    private static native byte[] writePrintPdf(byte[] path, byte[] password, int[] pages, byte[] destination, CancellationSignal cancellation);
+    void dispatchReaderCommand(int command, int element) { deliverCommand(command, element); }
 
     private static byte[] utf8(String value) {
         return value.getBytes(StandardCharsets.UTF_8);
@@ -40,7 +60,35 @@ public final class ViewerActivity extends NativeActivity {
     @Override
     protected void onCreate(Bundle state) {
         super.onCreate(state);
-        if (state == null) openIntent(getIntent());
+        // A recreated NativeActivity starts a new renderer and must reopen its PDF.
+        openIntent(getIntent());
+        ensureAccessibility();
+    }
+
+    private void ensureAccessibility() {
+        if (readerAccessibility == null) {
+            readerAccessibility = new ReaderAccessibilityView(this);
+            addContentView(readerAccessibility, new ViewGroup.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT));
+        }
+    }
+
+    public void updateAccessibility(byte[] bytes) {
+        String json = new String(bytes, StandardCharsets.UTF_8);
+        runOnUiThread(() -> {
+            if (isFinishing() || isDestroyed()) return;
+            ensureAccessibility();
+            try { readerAccessibility.update(new JSONObject(json)); } catch (org.json.JSONException ignored) { }
+        });
+    }
+
+    public void readerHover(byte[] bytes) {
+        String[] fields = new String(bytes, StandardCharsets.UTF_8).split(",");
+        if (fields.length != 3) return;
+        try {
+            float x = Float.parseFloat(fields[0]), y = Float.parseFloat(fields[1]);
+            int action = Integer.parseInt(fields[2]);
+            runOnUiThread(() -> { if (readerAccessibility != null) readerAccessibility.hoverAt(x, y, action); });
+        } catch (NumberFormatException ignored) { }
     }
 
     @Override
@@ -51,8 +99,10 @@ public final class ViewerActivity extends NativeActivity {
     }
 
     private void openIntent(Intent intent) {
-        if (Intent.ACTION_VIEW.equals(intent.getAction()) && intent.getData() != null) {
-            copyPdf(intent.getData(), "");
+        if (Intent.ACTION_VIEW.equals(intent.getAction()) && intent.getData() != null) copyPdf(intent.getData(), "");
+        else if (Intent.ACTION_SEND.equals(intent.getAction())) {
+            Uri stream = intent.getParcelableExtra(Intent.EXTRA_STREAM);
+            if (stream != null) copyPdf(stream, "");
         }
     }
 
@@ -74,6 +124,21 @@ public final class ViewerActivity extends NativeActivity {
     @Override
     protected void onActivityResult(int request, int result, Intent data) {
         super.onActivityResult(request, result, data);
+        if (request == SAVE_PDF) {
+            File copy = exportCopy; exportCopy = null;
+            if (copy == null) return;
+            if (result == RESULT_OK && data != null && data.getData() != null) {
+                Uri destination = data.getData();
+                files.execute(() -> {
+                    try (InputStream input = new java.io.FileInputStream(copy); OutputStream output = getContentResolver().openOutputStream(destination, "w")) {
+                        if (output == null) throw new IOException("No destination stream");
+                        transfer(input, output); fileError("Saved PDF copy.");
+                    } catch (IOException | RuntimeException error) { fileError("Could not save the PDF copy."); }
+                    finally { copy.delete(); }
+                });
+            } else copy.delete();
+            return;
+        }
         if (request != OPEN_PDF) return;
         pickerOpen = false;
         if (result == RESULT_OK && data != null && data.getData() != null) {
@@ -102,7 +167,7 @@ public final class ViewerActivity extends NativeActivity {
     }
 
     private void fileError(String message) {
-        deliverFile(utf8(""), utf8(""), utf8(message), utf8(""));
+        deliverNotice(utf8(message));
     }
 
     private String documentName(Uri uri) {
@@ -158,6 +223,7 @@ public final class ViewerActivity extends NativeActivity {
                 field.setInputType(InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_FLAG_CAP_SENTENCES);
             }
             field.setText(initial);
+            field.setSelectAllOnFocus(true);
             field.selectAll();
             AlertDialog dialog = new AlertDialog.Builder(this)
                 .setTitle(label)
@@ -169,12 +235,109 @@ public final class ViewerActivity extends NativeActivity {
             field.requestFocus();
             dialog.getWindow().setSoftInputMode(WindowManager.LayoutParams.SOFT_INPUT_STATE_ALWAYS_VISIBLE);
             dialog.show();
+            field.post(field::selectAll);
         });
+    }
+
+    public void copyText(byte[] value) {
+        String text = new String(value, StandardCharsets.UTF_8);
+        runOnUiThread(() -> ((ClipboardManager) getSystemService(Context.CLIPBOARD_SERVICE)).setPrimaryClip(ClipData.newPlainText("PDF text", text)));
+    }
+
+    public void openLink(byte[] value) {
+        Uri uri = Uri.parse(new String(value, StandardCharsets.UTF_8));
+        runOnUiThread(() -> {
+            try { startActivity(new Intent(Intent.ACTION_VIEW, uri)); }
+            catch (ActivityNotFoundException | SecurityException error) { fileError("No app is available to open this link."); }
+        });
+    }
+
+    private static void transfer(InputStream input, OutputStream output) throws IOException {
+        byte[] buffer = new byte[65536];
+        int count;
+        while ((count = input.read(buffer)) != -1) output.write(buffer, 0, count);
+    }
+
+    public void documentAction(byte[] value) {
+        try {
+            JSONObject args = new JSONObject(new String(value, StandardCharsets.UTF_8));
+            int command = args.getInt("command"), pages = args.getInt("pages");
+            String title = args.getString("title"), password = args.optString("password");
+            // Open the source now so changing documents cannot invalidate an in-flight copy.
+            InputStream source = new java.io.FileInputStream(args.getString("path"));
+            files.execute(() -> {
+                File snapshot = null;
+                try (InputStream input = source) {
+                    snapshot = File.createTempFile(command == 12 ? "shared-" : "output-", ".pdf", getCacheDir());
+                    try (OutputStream output = new FileOutputStream(snapshot)) { transfer(input, output); }
+                    File copy = snapshot;
+                    runOnUiThread(() -> finishDocumentAction(command, copy, title, password, pages));
+                } catch (IOException | RuntimeException error) {
+                    if (snapshot != null) snapshot.delete();
+                    fileError("Could not prepare this PDF.");
+                }
+            });
+        } catch (IOException | org.json.JSONException | RuntimeException error) { fileError("Could not prepare this PDF."); }
+    }
+
+    private void finishDocumentAction(int command, File copy, String title, String password, int pages) {
+        if (isFinishing() || isDestroyed()) { copy.delete(); return; }
+        if (command == 12) {
+            Uri uri = new Uri.Builder().scheme("content").authority(getPackageName() + ".files")
+                .appendPath(copy.getName()).appendQueryParameter("name", title).build();
+            Intent share = new Intent(Intent.ACTION_SEND).setType("application/pdf").putExtra(Intent.EXTRA_STREAM, uri)
+                .addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION);
+            share.setClipData(ClipData.newUri(getContentResolver(), title, uri));
+            try { startActivity(Intent.createChooser(share, "Share PDF")); }
+            catch (ActivityNotFoundException error) { copy.delete(); fileError("No sharing app is available."); }
+        } else if (command == 13) {
+            if (exportCopy != null) { copy.delete(); fileError("Finish saving the current copy first."); return; }
+            exportCopy = copy;
+            Intent create = new Intent(Intent.ACTION_CREATE_DOCUMENT).addCategory(Intent.CATEGORY_OPENABLE)
+                .setType("application/pdf").putExtra(Intent.EXTRA_TITLE, title);
+            try { startActivityForResult(create, SAVE_PDF); }
+            catch (ActivityNotFoundException error) { exportCopy = null; copy.delete(); fileError("The Android save dialog is unavailable."); }
+        } else if (command == 11) {
+            PrintManager manager = (PrintManager) getSystemService(Context.PRINT_SERVICE);
+            manager.print(title, new PrintDocumentAdapter() {
+                @Override public void onLayout(PrintAttributes oldAttributes, PrintAttributes attributes, CancellationSignal cancellation,
+                                               LayoutResultCallback callback, Bundle extras) {
+                    if (cancellation.isCanceled()) { callback.onLayoutCancelled(); return; }
+                    callback.onLayoutFinished(new PrintDocumentInfo.Builder(title).setContentType(PrintDocumentInfo.CONTENT_TYPE_DOCUMENT)
+                        .setPageCount(pages).build(), !attributes.equals(oldAttributes));
+                }
+                @Override public void onWrite(PageRange[] ranges, ParcelFileDescriptor destination, CancellationSignal cancellation, WriteResultCallback callback) {
+                    files.execute(() -> {
+                        File output = null;
+                        try {
+                            if (cancellation.isCanceled()) { callback.onWriteCancelled(); return; }
+                            ArrayList<Integer> wanted = new ArrayList<>();
+                            for (int i = 0; i < pages; i++) for (PageRange range : ranges) if (i >= range.getStart() && i <= range.getEnd()) { wanted.add(i); break; }
+                            int[] selected = new int[wanted.size()];
+                            for (int i = 0; i < selected.length; i++) selected[i] = wanted.get(i);
+                            output = File.createTempFile("print-", ".pdf", getCacheDir());
+                            byte[] error = writePrintPdf(utf8(copy.getAbsolutePath()), utf8(password), selected, utf8(output.getAbsolutePath()), cancellation);
+                            if (cancellation.isCanceled()) { callback.onWriteCancelled(); return; }
+                            if (error == null || error.length > 0) {
+                                callback.onWriteFailed(error == null ? "Could not prepare print pages." : new String(error, StandardCharsets.UTF_8)); return;
+                            }
+                            try (InputStream input = new java.io.FileInputStream(output); OutputStream stream = new FileOutputStream(destination.getFileDescriptor())) {
+                                transfer(input, stream);
+                            }
+                            if (cancellation.isCanceled()) callback.onWriteCancelled(); else callback.onWriteFinished(ranges);
+                        } catch (IOException | RuntimeException error) { callback.onWriteFailed("Could not write print pages."); }
+                        finally { if (output != null) output.delete(); }
+                    });
+                }
+                @Override public void onFinish() { copy.delete(); }
+            }, null);
+        } else copy.delete();
     }
 
     @Override
     protected void onDestroy() {
-        files.shutdownNow();
+        files.shutdown();
+        if (exportCopy != null) { exportCopy.delete(); exportCopy = null; }
         super.onDestroy();
     }
 }

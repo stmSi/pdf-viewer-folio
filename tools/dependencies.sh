@@ -13,7 +13,8 @@ fetch() {
     fi
     archive=".deps/$name.tar.gz"
     curl --fail --location --retry 2 --silent --show-error "$url" -o "$archive"
-    printf '%s  %s\n' "$checksum" "$archive" | sha256sum -c
+    # shasum is available on macOS as well as Linux (macOS sha256sum is not GNU).
+    printf '%s  %s\n' "$checksum" "$archive" | shasum -a 256 -c -
     tar -xzf "$archive" -C .deps
     rm "$archive"
 }
@@ -24,3 +25,5 @@ fetch raylib-6.2 \
 fetch mupdf-1.28.6-source \
     https://mupdf.com/downloads/archive/mupdf-1.28.6-source.tar.gz \
     dc85000640a45d90ca9b77b061f6ca67cce0c4d4fbecf8819647baf573eef101
+
+python3 tools/patch-raylib.py

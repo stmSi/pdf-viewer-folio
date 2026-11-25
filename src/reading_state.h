@@ -14,6 +14,7 @@ typedef struct {
     float zoom;
     bool fit_width;
     int version;
+    int layout, rotation;
 } SavedPosition;
 
 typedef struct {

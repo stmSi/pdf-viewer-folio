@@ -1,4 +1,7 @@
 #include "pdf.h"
+#include "pdf_worker.h"
+#include "json.h"
+#include "text_util.h"
 #include "platform.h"
 #include "reading_state.h"
 
@@ -20,29 +23,55 @@ EM_JS(int, web_height, (void), { return window.innerHeight; })
 extern const unsigned char folio_font[];
 extern const int folio_font_size;
 
-typedef enum { ORIGINAL, WARM, DARK, THEME_COUNT } Theme;
-typedef enum { INPUT_NONE, INPUT_PAGE, INPUT_PASSWORD, INPUT_PATH, INPUT_BOOKMARK } InputKind;
+typedef enum { ORIGINAL, WARM, DARK, SEPIA, SOFT_GRAY, SAGE, DUSK, NIGHT_AMBER, THEME_COUNT } Theme;
+typedef enum { INPUT_NONE, INPUT_PAGE, INPUT_PASSWORD, INPUT_PATH, INPUT_BOOKMARK, INPUT_FIND } InputKind;
 typedef enum { MENU_NONE, MENU_VIEW, MENU_THEME_TOP, MENU_THEME_BOTTOM, MENU_READING } Menu;
-typedef enum { READING_CONTENTS, READING_BOOKMARKS, READING_RECENT, READING_TAB_COUNT } ReadingTab;
+typedef enum { READING_CONTENTS, READING_BOOKMARKS, READING_RECENT, READING_THUMBNAILS, READING_TAB_COUNT } ReadingTab;
 typedef enum { CONTENTS_UNREAD, CONTENTS_READY, CONTENTS_FAILED } ContentsStatus;
-enum { RECENT_LIMIT = 24 };
+enum { RECENT_LIMIT = 24, HISTORY_LIMIT = 128, UI_LIMIT = 256 };
+typedef enum { VIEW_CONTINUOUS, VIEW_SINGLE, VIEW_SPREAD } ViewMode;
 
 typedef struct {
-    Color background, panel, ink, muted, line, button, hover, accent, accent_ink, paper;
+    Color background, panel, ink, muted, line, button, hover, accent, accent_ink, paper, page_ink;
 } Palette;
 
 static const Palette palettes[] = {
     {{232, 235, 240, 255}, {252, 253, 255, 255}, {29, 37, 53, 255}, {82, 94, 111, 255},
      {215, 222, 232, 255}, {238, 242, 248, 255}, {224, 232, 246, 255}, {38, 73, 139, 255},
-     {255, 255, 255, 255}, {255, 255, 255, 255}},
+     {255, 255, 255, 255}, {255, 255, 255, 255}, {0, 0, 0, 255}},
     {{226, 220, 206, 255}, {250, 245, 233, 255}, {49, 41, 31, 255}, {104, 90, 74, 255},
      {222, 210, 190, 255}, {241, 232, 215, 255}, {233, 219, 195, 255}, {112, 68, 36, 255},
-     {255, 255, 255, 255}, {249, 236, 209, 255}},
+     {255, 255, 255, 255}, {249, 236, 209, 255}, {43, 33, 23, 255}},
     {{27, 29, 34, 255}, {38, 41, 49, 255}, {231, 235, 243, 255}, {171, 182, 200, 255},
-     {60, 67, 80, 255}, {49, 55, 67, 255}, {63, 73, 90, 255}, {164, 198, 254, 255}, {16, 37, 66, 255}, {32, 35, 42, 255}}
+     {60, 67, 80, 255}, {49, 55, 67, 255}, {63, 73, 90, 255}, {164, 198, 254, 255},
+     {16, 37, 66, 255}, {32, 35, 42, 255}, {232, 235, 240, 255}},
+    // Sepia: deeper parchment with brown ink.
+    {{213, 198, 172, 255}, {236, 222, 197, 255}, {72, 51, 34, 255}, {106, 84, 60, 255},
+     {197, 177, 146, 255}, {226, 208, 178, 255}, {215, 193, 159, 255}, {117, 75, 41, 255},
+     {255, 246, 227, 255}, {232, 215, 181, 255}, {72, 51, 34, 255}},
+    // Soft Gray: a neutral page without a bright white background.
+    {{202, 206, 206, 255}, {229, 232, 231, 255}, {50, 57, 57, 255}, {84, 93, 92, 255},
+     {182, 190, 188, 255}, {216, 222, 220, 255}, {202, 213, 209, 255}, {61, 91, 81, 255},
+     {244, 248, 246, 255}, {221, 225, 223, 255}, {58, 62, 63, 255}},
+    // Sage: muted green paper and a matching, quiet interface.
+    {{195, 208, 190, 255}, {224, 234, 218, 255}, {43, 60, 45, 255}, {78, 98, 77, 255},
+     {174, 194, 166, 255}, {208, 223, 201, 255}, {192, 213, 184, 255}, {65, 101, 63, 255},
+     {245, 249, 239, 255}, {216, 230, 207, 255}, {47, 62, 52, 255}},
+    // Dusk: a softer dark page with a warm gray foreground.
+    {{38, 35, 43, 255}, {53, 48, 59, 255}, {221, 212, 219, 255}, {175, 161, 175, 255},
+     {79, 69, 85, 255}, {65, 57, 72, 255}, {84, 71, 91, 255}, {202, 176, 210, 255},
+     {48, 33, 55, 255}, {48, 43, 54, 255}, {215, 205, 207, 255}},
+    // Night Amber: dim, warm lettering on a brown charcoal page.
+    {{28, 25, 20, 255}, {42, 36, 27, 255}, {226, 196, 147, 255}, {173, 148, 111, 255},
+     {74, 61, 42, 255}, {57, 47, 32, 255}, {77, 61, 39, 255}, {216, 174, 103, 255},
+     {38, 28, 14, 255}, {38, 33, 25, 255}, {216, 186, 139, 255}}
 };
 
-static const char *theme_names[] = {"Original", "Warm Paper", "Dark"};
+static const char *theme_names[] = {
+    "Original", "Warm Paper", "Dark", "Sepia", "Soft Gray", "Sage", "Dusk", "Night Amber"
+};
+_Static_assert(sizeof palettes / sizeof *palettes == THEME_COUNT, "Every theme needs a palette");
+_Static_assert(sizeof theme_names / sizeof *theme_names == THEME_COUNT, "Every theme needs a name");
 static const float wheel_scroll_distance = 104.0f;
 
 typedef struct {
@@ -53,7 +82,9 @@ typedef struct {
 
 typedef struct {
     PdfBox bounds, crop;
-    PageTexture preview, detail;
+    PageTexture preview, detail, thumbnail;
+    PdfText *text;
+    bool preview_pending, detail_pending, text_pending, thumb_pending, text_failed;
     double offset;
     float scale, width, height;
     bool crop_ready, preview_attempted;
@@ -61,15 +92,20 @@ typedef struct {
 
 typedef struct {
     float ui, width, height, bar;
-    Rectangle body, open, reading, theme, settings, title, prev, page, next, out, fit, in, bottom_theme;
+    Rectangle body, open, find, reading, theme, settings, title, prev, page, next, out, fit, in, bottom_theme;
+    Rectangle search_field, search_prev, search_next, search_close, loading_cancel;
+    Rectangle brightness_less, brightness_more;
+    Rectangle modes[3], rotate_left, rotate_right, history_back, history_forward, print, share, export_copy;
     Rectangle popup, theme_popup, themes[THEME_COUNT], view_theme, crop, brightness, focus, status;
     Rectangle dialog, field, cancel, confirm;
 } Layout;
 
 typedef struct {
-    Vector2 point, start, previous, pinch_center;
+    Vector2 point, start, previous, delta, pinch_center;
     float pinch_distance;
     bool down, pressed, released, moved, pinch;
+    int touches;
+    double began;
 } Pointer;
 
 typedef struct {
@@ -89,24 +125,61 @@ typedef struct {
     size_t *visible_contents, visible_count;
     ContentsStatus contents_status;
     ScrollbarDrag scrollbar;
-    size_t bookmark_count, session_count, start, selected;
+    size_t bookmark_count, session_count, selected;
+    double scroll; // Fractional rows, independent of the keyboard selection.
     ReadingTab tab;
     Vector2 anchor;
     bool context;
 } ReadingMenu;
 
 typedef struct {
+    int page;
+    size_t first, last;
+    bool active, dragging;
+    int handle;
+} TextSelection;
+
+typedef struct {
+    Rectangle box;
+    char label[256];
+    unsigned id;
+    bool enabled, selected, text;
+} UiElement;
+
+typedef struct {
     Pdf *pdf, *locked;
+    PdfWorker *worker, *opening;
+    FileEvent source, opening_file;
+    char password[256], opening_password[256];
+    bool password_requested, loading_cancelled;
+    int opening_done, opening_total;
+    TextSelection selection;
+    bool search_open, search_auto_jump;
+    char query[256];
+    PdfSearch search;
+    int search_index;
+    SavedPosition history[HISTORY_LIMIT];
+    int history_count, history_cursor;
+    bool history_restoring;
+    ViewMode view_mode;
+    int rotation, thumb_start, thumb_end;
+    float view_scroll;
+    double accessibility_due;
+    UiElement elements[UI_LIMIT];
+    size_t element_count;
+    unsigned focus_id;
+    bool building_menu, keyboard_activation;
     char title[FOLIO_NAME_MAX], pending_title[FOLIO_NAME_MAX];
     char pending_locator[FOLIO_PATH_MAX];
     char message[320], input[FOLIO_PATH_MAX];
     ReadingPage *pages;
     Layout layout;
     Pointer pointer;
+    Vector2 wheel;
     ScrollbarDrag scrollbar;
     Font font;
     Shader shader;
-    int shader_theme, shader_brightness;
+    int shader_theme, shader_brightness, shader_paper, shader_ink;
     int page, page_count, cache_start, cache_end, theme_cursor;
     float zoom, brightness, pan, widest;
     double scroll, document_height, render_due, save_due, message_until;
@@ -116,10 +189,39 @@ typedef struct {
     SavedPosition pending_bookmark;
     uint64_t bookmark_document, resume_document;
     InputKind input_kind;
-    bool crop, fit_width, focused, system_input, input_replace, resuming, bookmark_edit;
+    bool crop, fit_width, focused, system_input, input_replace, resuming, bookmark_edit, quit;
 } Viewer;
 
 static Viewer viewer;
+
+static void begin_find(void);
+static void find_next(int direction);
+static void search_close(void);
+static void copy_selection(void);
+static void select_all_text(void);
+static void history_push(void);
+static void history_move(int direction);
+static void set_view_mode(ViewMode mode);
+static void rotate_document(int direction);
+static bool selection_pointer(void);
+static void draw_interaction(void);
+static void draw_search(void);
+static void draw_loading(void);
+static void draw_focus(void);
+static void update_loading(void);
+static void update_document_work(void);
+static void update_search(void);
+static void update_commands(void);
+static void update_keyboard_focus(void);
+static void publish_accessibility(void);
+static void register_element(Rectangle box, const char *label, bool enabled, bool selected, bool text);
+static bool follow_link_at(Vector2 point);
+static void document_action(int action);
+static Vector2 pdf_to_screen(int page,Vector2 point);
+static Vector2 screen_to_pdf(int page,Vector2 point);
+static Rectangle pdf_box_screen(int page,PdfBox box);
+static Rectangle selection_copy_box(void);
+static void draw_thumbnail_row(Rectangle row,size_t index);
 
 static float minf(float a, float b) { return fminf(a, b); }
 static float maxf(float a, float b) { return fmaxf(a, b); }
@@ -137,6 +239,14 @@ static Vector2 center(Rectangle box)
 static bool contains(Rectangle box, Vector2 point)
 {
     return CheckCollisionPointRec(point, box);
+}
+
+static bool back_pressed(void)
+{
+#if defined(__ANDROID__)
+    if (IsKeyPressed(KEY_BACK)) return true;
+#endif
+    return IsKeyPressed(KEY_ESCAPE);
 }
 
 static void set_message(const char *message)
@@ -170,18 +280,28 @@ static Layout layout(void)
     result.bar = bar;
     result.body = viewer.focused ? rect(0, 0, result.width, result.height)
                                  : rect(0, bar, result.width, maxf(1, result.height - 2 * bar));
-    bool compact = result.width < 410 * u;
+    if (viewer.search_open) {
+        result.search_field = rect(8*u, bar+4*u, result.width-144*u, 44*u);
+        result.search_prev = rect(result.width-130*u, bar+4*u, 38*u, 44*u);
+        result.search_next = rect(result.width-88*u, bar+4*u, 38*u, 44*u);
+        result.search_close = rect(result.width-46*u, bar+4*u, 38*u, 44*u);
+        result.body.y += 52*u;
+        result.body.height = maxf(1, result.body.height-52*u);
+    }
+    result.loading_cancel = rect(result.width-106*u, result.body.y+8*u, 94*u, 38*u);
+    bool compact = result.width < 560 * u;
     float toolbar_scale = minf(1, maxf(0.5f, (result.width - 24 * u) / (274 * u)));
-    float open_width = (compact ? 62 : 98) * u * toolbar_scale;
-    float view_width = 58 * u * toolbar_scale;
-    float theme_width = (compact ? 74 : 86) * u * toolbar_scale;
-    float reading_width = (compact ? 80 : 94) * u * toolbar_scale;
+    float open_width = (compact ? 54 : 88) * u * toolbar_scale;
+    float view_width = (compact ? 46 : 54) * u * toolbar_scale;
+    float theme_width = (compact ? 62 : 82) * u * toolbar_scale;
+    float reading_width = (compact ? 66 : 88) * u * toolbar_scale;
     result.open = rect(x, y, open_width, button);
+    result.find = rect(x+open_width+gap, y, (compact ? 44 : 62)*u, button);
     result.settings = rect(result.width - view_width - x, y, view_width, button);
     result.theme = rect(result.settings.x - theme_width - gap, y, theme_width, button);
     result.reading = rect(result.theme.x - reading_width - gap, y, reading_width, button);
-    result.title = rect(result.open.x + result.open.width + 12 * u, y,
-                        result.reading.x - result.open.x - result.open.width - 24 * u, button);
+    result.title = rect(result.find.x + result.find.width + 12*u, y,
+                        result.reading.x-result.find.x-result.find.width-24*u, button);
 
     float group = minf(428 * u, result.width - 2 * x);
     x = (result.width - group) * 0.5f;
@@ -198,23 +318,40 @@ static Layout layout(void)
     result.bottom_theme = rect(result.in.x + key_width + gap, y, key_width, button);
 
     float panel_width = minf(result.width - 16 * u, 360 * u);
-    result.popup = rect(result.width - panel_width - 8 * u, bar + 8 * u, panel_width, 193 * u);
+    result.popup = rect(result.width-panel_width-8*u, result.body.y+8*u, panel_width,
+                        minf(450*u, maxf(80*u, result.body.height-16*u)));
     x = result.popup.x + 12 * u;
     float inner = result.popup.width - 24 * u;
-    y = result.popup.y + 8 * u;
+    y = result.popup.y + 8*u - viewer.view_scroll;
     result.view_theme = rect(x, y, inner, button);
-    result.brightness = rect(x, y + 60 * u, inner, 26 * u);
+    result.brightness=rect(x+42*u,y+60*u,inner-84*u,26*u);
+    result.brightness_less=rect(x,y+52*u,34*u,42*u);
+    result.brightness_more=rect(x+inner-34*u,y+52*u,34*u,42*u);
     result.crop = rect(x, y + 91 * u, inner, button);
-    result.focus = rect(x, y + 137 * u, inner, button);
+    result.focus = rect(x, y+137*u, inner, button);
+    float third = (inner-8*u)/3;
+    for (int i=0; i<3; i++) result.modes[i]=rect(x+i*(third+4*u), y+183*u, third, button);
+    float half = (inner-4*u)/2;
+    result.rotate_left=rect(x,y+229*u,half,button);
+    result.rotate_right=rect(x+half+4*u,y+229*u,half,button);
+    result.history_back=rect(x,y+275*u,half,button);
+    result.history_forward=rect(x+half+4*u,y+275*u,half,button);
+    result.print=rect(x,y+321*u,half,button);
+    result.share=rect(x+half+4*u,y+321*u,half,button);
+    result.export_copy=rect(x,y+367*u,inner,button);
 
     Rectangle trigger = viewer.menu == MENU_THEME_BOTTOM ? result.bottom_theme : result.theme;
-    float menu_width = minf(178 * u, result.width - 16 * u);
-    float menu_height = THEME_COUNT * button + 12 * u;
+    int columns = THEME_COUNT * button + 12 * u > result.height - 2 * bar - 12 * u ? 2 : 1;
+    int rows = (THEME_COUNT + columns - 1) / columns;
+    float menu_width = minf(190 * columns * u, result.width - 16 * u);
+    float menu_height = rows * button + 12 * u;
+    float column_width = (menu_width - 12 * u) / columns;
     float menu_x = Clamp(trigger.x + trigger.width - menu_width, 8 * u, result.width - menu_width - 8 * u);
     float menu_y = viewer.menu == MENU_THEME_BOTTOM ? result.height - bar - menu_height - 6 * u : bar + 6 * u;
     result.theme_popup = rect(menu_x, menu_y, menu_width, menu_height);
     for (int i = 0; i < THEME_COUNT; i++)
-        result.themes[i] = rect(menu_x + 6 * u, menu_y + 6 * u + i * button, menu_width - 12 * u, button);
+        result.themes[i] = rect(menu_x + 6 * u + (i / rows) * column_width,
+                                menu_y + 6 * u + (i % rows) * button, column_width, button);
 
     float dialog_width = minf(460 * u, result.width - 24 * u);
     result.dialog = rect((result.width - dialog_width) * 0.5f, (result.height - 171 * u) * 0.5f,
@@ -245,31 +382,43 @@ static void measure_document(void)
     float margin = page_margin();
     double offset = 0;
     viewer.widest = 0;
-    for (int i = 0; i < viewer.page_count; i++) {
-        ReadingPage *page = &viewer.pages[i];
-        PdfBox bounds = reading_bounds(page);
-        float width = bounds.x1 - bounds.x0;
-        float height = bounds.y1 - bounds.y0;
-        float scale = maxf(1, body.width - 2 * margin) / width;
-        if (!viewer.fit_width) scale = minf(scale, maxf(1, body.height - 2 * margin) / height);
-        page->offset = offset;
-        page->scale = scale;
-        page->width = width * scale;
-        page->height = height * scale;
-        viewer.widest = maxf(viewer.widest, page->width);
-        offset += page->height;
+    int columns = viewer.view_mode == VIEW_SPREAD ? 2 : 1;
+    for (int i=0; i<viewer.page_count; i+=columns) {
+        float widths[2]={0}, heights[2]={0};
+        int count= i+columns<=viewer.page_count ? columns : 1;
+        for (int j=0;j<count;j++) {
+            PdfBox bounds=reading_bounds(&viewer.pages[i+j]);
+            widths[j]=bounds.x1-bounds.x0;
+            heights[j]=bounds.y1-bounds.y0;
+            if (viewer.rotation%2) { float swap=widths[j];widths[j]=heights[j];heights[j]=swap; }
+        }
+        float width=widths[0]+widths[1];
+        float height=maxf(heights[0],heights[1]);
+        float scale=maxf(1,body.width-2*margin-(count-1)*page_gap())/width;
+        if (!viewer.fit_width) scale=minf(scale,maxf(1,body.height-2*margin)/height);
+        for(int j=0;j<count;j++) {
+            ReadingPage *page=&viewer.pages[i+j];
+            page->offset=offset;
+            page->scale=scale;
+            page->width=widths[j]*scale;
+            page->height=heights[j]*scale;
+        }
+        viewer.widest=maxf(viewer.widest,width*scale);
+        offset+=height*scale;
     }
-    viewer.document_height = offset;
+    viewer.document_height=offset;
 }
 
 static double page_top(int index)
 {
-    return page_margin() + viewer.pages[index].offset * viewer.zoom + (double)index * page_gap();
+    if (viewer.view_mode==VIEW_SINGLE) return page_margin();
+    int row=viewer.view_mode==VIEW_SPREAD?index/2:index;
+    return page_margin()+viewer.pages[index].offset*viewer.zoom+(double)row*page_gap();
 }
 
 static double page_bottom(int index)
 {
-    return page_top(index) + viewer.pages[index].height * viewer.zoom;
+    return page_top(index)+viewer.pages[index].height*viewer.zoom;
 }
 
 static float pan_limit(float width)
@@ -279,40 +428,49 @@ static float pan_limit(float width)
 
 static Rectangle page_rect(int index)
 {
-    Rectangle body = viewer.layout.body;
-    const ReadingPage *page = &viewer.pages[index];
-    float width = page->width * viewer.zoom;
-    float limit = pan_limit(width);
-    float x = body.x + (body.width - width) * 0.5f + Clamp(viewer.pan, -limit, limit);
-    return rect(x, body.y + (float)(page_top(index) - viewer.scroll), width, page->height * viewer.zoom);
+    Rectangle body=viewer.layout.body;
+    const ReadingPage *page=&viewer.pages[index];
+    float width=page->width*viewer.zoom;
+    float group_width=width;
+    if(viewer.view_mode==VIEW_SPREAD) {
+        int left=index-index%2;
+        group_width=viewer.pages[left].width*viewer.zoom;
+        if(left+1<viewer.page_count) group_width+=viewer.pages[left+1].width*viewer.zoom+page_gap();
+    }
+    float x=body.x+(body.width-group_width)*.5f+Clamp(viewer.pan,-pan_limit(group_width),pan_limit(group_width));
+    if(viewer.view_mode==VIEW_SPREAD && index%2) x+=viewer.pages[index-1].width*viewer.zoom+page_gap();
+    return rect(x,body.y+(float)(page_top(index)-viewer.scroll),width,page->height*viewer.zoom);
 }
 
 static int page_at(double offset)
 {
-    int first = 0;
-    int end = viewer.page_count;
-    while (first < end) {
-        int middle = first + (end - first) / 2;
-        if (page_bottom(middle) <= offset) first = middle + 1;
-        else end = middle;
+    if(viewer.view_mode==VIEW_SINGLE) return viewer.page;
+    int columns=viewer.view_mode==VIEW_SPREAD?2:1;
+    int first=0,end=(viewer.page_count+columns-1)/columns;
+    while(first<end) {
+        int middle=first+(end-first)/2;
+        int index=middle*columns;
+        double bottom=page_bottom(index);
+        if(columns==2 && index+1<viewer.page_count) bottom=fmax(bottom,page_bottom(index+1));
+        if(bottom<=offset) first=middle+1; else end=middle;
     }
-    return first < viewer.page_count ? first : viewer.page_count - 1;
+    int index=first*columns;
+    return index<viewer.page_count?index:(viewer.page_count-1)/columns*columns;
 }
 
 static double document_height(void)
 {
-    return 2 * page_margin() + viewer.document_height * viewer.zoom +
-        (double)(viewer.page_count - 1) * page_gap();
+    if(viewer.view_mode==VIEW_SINGLE) return 2*page_margin()+viewer.pages[viewer.page].height*viewer.zoom;
+    int rows=viewer.view_mode==VIEW_SPREAD?(viewer.page_count+1)/2:viewer.page_count;
+    return 2*page_margin()+viewer.document_height*viewer.zoom+(double)(rows-1)*page_gap();
 }
 
 static void clamp_view(void)
 {
-    float limit = pan_limit(viewer.widest * viewer.zoom);
-    viewer.pan = Clamp(viewer.pan, -limit, limit);
-    double max_scroll = fmax(0, document_height() - viewer.layout.body.height);
-    viewer.scroll = fmax(0, fmin(max_scroll, viewer.scroll));
-    viewer.page = max_scroll > 0 && viewer.scroll >= max_scroll - 0.5
-        ? viewer.page_count - 1 : page_at(viewer.scroll + page_margin());
+    viewer.pan=Clamp(viewer.pan,-pan_limit(viewer.widest*viewer.zoom),pan_limit(viewer.widest*viewer.zoom));
+    double maximum=fmax(0,document_height()-viewer.layout.body.height);
+    viewer.scroll=fmax(0,fmin(maximum,viewer.scroll));
+    if(viewer.view_mode!=VIEW_SINGLE) viewer.page=page_at(viewer.scroll+page_margin());
 }
 
 static void refresh(double delay)
@@ -324,13 +482,19 @@ static void refresh(double delay)
 static Vector2 reading_point(void)
 {
     Rectangle body = viewer.layout.body;
-    return (Vector2){body.x + body.width * 0.5f, body.y + page_margin()};
+    float x=body.x+body.width*.5f;
+    if(viewer.view_mode==VIEW_SPREAD && viewer.pdf!=NULL) {
+        Rectangle page=page_rect(viewer.page);
+        x=page.x+page.width*.5f;
+    }
+    return (Vector2){x,body.y+page_margin()};
 }
 
 static ReadingPosition position_at(Vector2 point)
 {
-    int index = page_at(viewer.scroll + point.y - viewer.layout.body.y);
-    Rectangle page = page_rect(index);
+    int index=page_at(viewer.scroll+point.y-viewer.layout.body.y);
+    if(viewer.view_mode==VIEW_SPREAD && index+1<viewer.page_count && contains(page_rect(index+1),point)) index++;
+    Rectangle page=page_rect(index);
     return (ReadingPosition){index, (point.x - page.x) / page.width,
         (viewer.scroll + point.y - viewer.layout.body.y - page_top(index)) / page.height};
 }
@@ -347,7 +511,7 @@ static void restore_position(ReadingPosition location, Vector2 point)
 
 static SavedPosition current_position(void)
 {
-    return (SavedPosition){position_at(reading_point()), viewer.zoom, viewer.fit_width, 2};
+    return (SavedPosition){position_at(reading_point()),viewer.zoom,viewer.fit_width,3,viewer.view_mode,viewer.rotation};
 }
 
 static void save_reading(void)
@@ -389,28 +553,16 @@ static void release_texture(PageTexture *page)
     *page = (PageTexture){0};
 }
 
-static bool update_texture(PageTexture *target, Pdf *pdf, float scale, PixelBox pixels)
+static bool upload_texture(PageTexture *target, PdfImage image, float scale, PixelBox pixels)
 {
-    PdfImage image;
-    char error[256];
-    if (!pdf_render(pdf, scale, pixels, &image, error, sizeof error)) {
-        set_message(error);
-        return false;
-    }
-    Image raw = {image.pixels, image.width, image.height, 1, PIXELFORMAT_UNCOMPRESSED_R8G8B8};
-    Texture2D texture = LoadTextureFromImage(raw);
-    pdf_image_free(&image);
-    if (!IsTextureValid(texture)) {
-        set_message("Could not upload the PDF page to the display.");
-        return false;
-    }
-
-    SetTextureFilter(texture, TEXTURE_FILTER_BILINEAR);
+    Image raw={image.pixels,image.width,image.height,1,PIXELFORMAT_UNCOMPRESSED_R8G8B8};
+    Texture2D texture=LoadTextureFromImage(raw);
+    if(!IsTextureValid(texture)) { set_message("Could not upload the PDF page to the display."); return false; }
+    SetTextureFilter(texture,TEXTURE_FILTER_BILINEAR);
     release_texture(target);
-    target->texture = texture;
-    target->scale = scale;
-    target->area = (PdfBox){pixels.x0 / scale, pixels.y0 / scale,
-                            pixels.x1 / scale, pixels.y1 / scale};
+    target->texture=texture;
+    target->scale=scale;
+    target->area=(PdfBox){pixels.x0/scale,pixels.y0/scale,pixels.x1/scale,pixels.y1/scale};
     return true;
 }
 
@@ -429,35 +581,43 @@ static void clear_cached_page(ReadingPage *page)
 
 static void close_document(void)
 {
-    for (int i = viewer.cache_start; i < viewer.cache_end; i++) clear_cached_page(&viewer.pages[i]);
-    viewer.cache_start = 0;
-    viewer.cache_end = 0;
+    for(int i=0;i<viewer.page_count;i++) {
+        clear_cached_page(&viewer.pages[i]);
+        release_texture(&viewer.pages[i].thumbnail);
+        pdf_text_free(viewer.pages[i].text);
+    }
+    viewer.cache_start=viewer.cache_end=0;
     free(viewer.pages);
-    viewer.pages = NULL;
+    viewer.pages=NULL;
+    viewer.page_count=0;
     pdf_free_contents(&viewer.reading.contents);
     free(viewer.reading.visible_contents);
-    viewer.reading.visible_contents = NULL;
-    viewer.reading.visible_count = 0;
-    viewer.reading.contents_status = CONTENTS_UNREAD;
-    viewer.scrollbar.active = false;
-    pdf_close(viewer.pdf);
-    viewer.pdf = NULL;
+    viewer.reading.visible_contents=NULL;
+    viewer.reading.visible_count=0;
+    viewer.reading.contents_status=CONTENTS_UNREAD;
+    viewer.scrollbar.active=false;
+    worker_search_free(&viewer.search);
+    viewer.search_open=false;
+    viewer.search_index=-1;
+    viewer.selection=(TextSelection){0};
+    viewer.history_count=viewer.history_cursor=0;
+    worker_close(viewer.worker);
+    viewer.worker=NULL;
+    viewer.pdf=NULL;
+    platform_remove_temp(&viewer.source);
+    viewer.source=(FileEvent){0};
+    memset(viewer.password,0,sizeof viewer.password);
 }
 
-static bool select_page(int index)
+static void render_preview(int index)
 {
-    char error[256];
-    if (pdf_set_page(viewer.pdf, index, error, sizeof error)) return true;
-    set_message(error);
-    return false;
-}
-
-static void render_preview(ReadingPage *page)
-{
-    PdfBox full = page->bounds;
-    float side = maxf(full.x1 - full.x0, full.y1 - full.y0);
-    float scale = minf(860.0f / side, page->scale * maxf(0.5f, viewer.zoom));
-    update_texture(&page->preview, viewer.pdf, scale, pixel_box(full, scale));
+    ReadingPage *page=&viewer.pages[index];
+    if(page->preview_pending) return;
+    PdfBox full=page->bounds;
+    float side=maxf(full.x1-full.x0,full.y1-full.y0);
+    float scale=minf(860.0f/side,page->scale*maxf(.5f,viewer.zoom));
+    PdfRequest request={WORK_PREVIEW,index,scale,pixel_box(full,scale),viewer.crop&&!page->crop_ready};
+    if(worker_request(viewer.worker,request)) page->preview_pending=true;
 }
 
 static void extend_render_range(float *start, float *end, float page_start, float page_end,
@@ -481,12 +641,10 @@ static bool render_detail(int index, float density)
     if (item->preview.texture.id == 0) return false;
     PdfBox full = reading_bounds(item);
     float display_scale = item->scale * viewer.zoom;
-    PdfBox bounds = {
-        maxf(full.x0, full.x0 + (visible.x - page.x) / display_scale),
-        maxf(full.y0, full.y0 + (visible.y - page.y) / display_scale),
-        minf(full.x1, full.x0 + (visible.x + visible.width - page.x) / display_scale),
-        minf(full.y1, full.y0 + (visible.y + visible.height - page.y) / display_scale)
-    };
+    Vector2 a=screen_to_pdf(index,(Vector2){visible.x,visible.y});
+    Vector2 b=screen_to_pdf(index,(Vector2){visible.x+visible.width,visible.y+visible.height});
+    PdfBox bounds={maxf(full.x0,minf(a.x,b.x)),maxf(full.y0,minf(a.y,b.y)),
+                   minf(full.x1,maxf(a.x,b.x)),minf(full.y1,maxf(a.y,b.y))};
     float width = bounds.x1 - bounds.x0;
     float height = bounds.y1 - bounds.y0;
     if (width <= 0 || height <= 0) return false;
@@ -513,11 +671,15 @@ static bool render_detail(int index, float density)
     extend_render_range(&bounds.x0, &bounds.x1, full.x0, full.x1,
                         96 * viewer.layout.ui / display_scale,
                         minf(max_span, pixel_area / (bounds.y1 - bounds.y0)));
-    return select_page(index) && update_texture(detail, viewer.pdf, scale, pixel_box(bounds, scale));
+    if(item->detail_pending) return false;
+    PdfRequest request={WORK_DETAIL,index,scale,pixel_box(bounds,scale),false};
+    item->detail_pending=worker_request(viewer.worker,request);
+    return item->detail_pending;
 }
 
 static int visible_end(int first)
 {
+    if(viewer.view_mode==VIEW_SINGLE) return first+1;
     double bottom = viewer.scroll + viewer.layout.body.height;
     int end = first;
     while (end < viewer.page_count && page_top(end) < bottom) end++;
@@ -526,103 +688,80 @@ static int visible_end(int first)
 
 static void update_visible_pages(void)
 {
-    int first = page_at(viewer.scroll);
-    int end = visible_end(first);
-    int start_cache = first > 0 ? first - 1 : first;
-    int end_cache = end < viewer.page_count ? end + 1 : end;
-    for (int i = viewer.cache_start; i < viewer.cache_end; i++) {
-        if (i < start_cache || i >= end_cache) clear_cached_page(&viewer.pages[i]);
-    }
-    viewer.cache_start = start_cache;
-    viewer.cache_end = end_cache;
-
-    ReadingPosition anchor = position_at(reading_point());
-    bool crop_changed = false;
-    // Keep each frame responsive as previously unseen pages enter the viewport.
-    int budget = 2;
-    for (int i = first; i < end && budget > 0; i++) {
-        ReadingPage *item = &viewer.pages[i];
-        bool needs_crop = viewer.crop && !item->crop_ready;
-        if (item->preview_attempted && !needs_crop) continue;
-        budget--;
-        bool loaded = select_page(i);
-        if (needs_crop) {
-            item->crop = loaded ? pdf_content_bounds(viewer.pdf) : item->bounds;
-            item->crop_ready = true;
-            crop_changed = true;
-        }
-        if (!item->preview_attempted) {
-            item->preview_attempted = true;
-            if (loaded) render_preview(item);
-            if (viewer.render_due < 0) viewer.render_due = GetTime();
+    int first=page_at(viewer.scroll),end=visible_end(first);
+    int start_cache=first>0?first-1:first;
+    int end_cache=end<viewer.page_count?end+1:end;
+    for(int i=viewer.cache_start;i<viewer.cache_end;i++) {
+        if(i<start_cache||i>=end_cache) {
+            clear_cached_page(&viewer.pages[i]);
+            if(!viewer.selection.active||viewer.selection.page!=i) {
+                pdf_text_free(viewer.pages[i].text);
+                viewer.pages[i].text=NULL;
+            }
         }
     }
-    if (crop_changed) {
-        measure_document();
-        restore_position(anchor, reading_point());
-        refresh(0);
-        return;
+    viewer.cache_start=start_cache;viewer.cache_end=end_cache;
+    for(int i=first;i<end;i++) {
+        ReadingPage *page=&viewer.pages[i];
+        if(!page->text&&!page->text_pending&&!page->text_failed)
+            page->text_pending=worker_request(viewer.worker,(PdfRequest){.kind=WORK_TEXT,.page=i});
+        if(!page->preview_attempted&&!page->preview_pending) render_preview(i);
+        else if(viewer.crop&&!page->crop_ready&&!page->preview_pending) render_preview(i);
     }
-
-    if (viewer.render_due < 0 || GetTime() < viewer.render_due || viewer.pointer.pinch) return;
-    float density = maxf(GetRenderWidth() / viewer.layout.width, GetRenderHeight() / viewer.layout.height);
-    int rendered = 0;
-    for (int i = first; i < end; i++) {
-        if (render_detail(i, Clamp(density, 1.0f, 4.0f)) && ++rendered == 2) {
-            viewer.render_due = GetTime();
-            return;
-        }
-    }
-    viewer.render_due = -1;
+    if(viewer.render_due<0||GetTime()<viewer.render_due||viewer.pointer.pinch) return;
+    float density=maxf(GetRenderWidth()/viewer.layout.width,GetRenderHeight()/viewer.layout.height);
+    for(int i=first;i<end;i++) render_detail(i,Clamp(density,1,4));
+    viewer.render_due=-1;
 }
 
 static void show_page(int index)
 {
-    if (viewer.pdf == NULL || index < 0 || index >= viewer.page_count) return;
-    viewer.pan = 0;
-    viewer.scroll = page_top(index) - page_margin();
+    if(!viewer.pdf||index<0||index>=viewer.page_count) return;
+    history_push();
+    viewer.page=index;
+    viewer.pan=0;
+    viewer.scroll=page_top(index)-page_margin();
     clamp_view();
-    viewer.page = index;
+    viewer.page=index;
+    viewer.selection=(TextSelection){0};
     refresh(0);
 }
 
-static void use_document(Pdf *document, const char *name, const char *locator)
+static int adjacent_page(int direction)
 {
-    save_reading();
-    int count = pdf_page_count(document);
-    ReadingPage *pages = calloc((size_t)count, sizeof *pages);
-    if (pages == NULL) {
-        pdf_close(document);
-        set_message("Out of memory measuring PDF pages.");
-        return;
-    }
-    for (int i = 0; i < count; i++) {
-        if (!pdf_measure_page(document, i, &pages[i].bounds))
-            pages[i].bounds = (PdfBox){0, 0, 612, 792};
-    }
+    return viewer.view_mode==VIEW_SPREAD ? (viewer.page/2+direction)*2 : viewer.page+direction;
+}
 
+static void change_page(int direction)
+{
+    show_page(adjacent_page(direction));
+}
+
+static void use_document(PdfWorker *worker, const FileEvent *file)
+{
+    Pdf *document=worker_document(worker);
+    int count=pdf_page_count(document);
+    ReadingPage *pages=calloc((size_t)count,sizeof *pages);
+    if(!pages) {
+        worker_close(worker);platform_remove_temp(file);
+        set_message("Out of memory measuring PDF pages.");return;
+    }
+    for(int i=0;i<count;i++) worker_bounds(worker,i,&pages[i].bounds);
     SavedPosition position;
-    if (!reading_load_position(pdf_key(document), &position) || position.location.page >= count)
-        position = (SavedPosition){{0, 0.5, 0}, 1, true, 2};
-
+    if(!reading_load_position(pdf_key(document),&position)||position.location.page>=count)
+        position=(SavedPosition){{0,.5,0},1,true,3,VIEW_CONTINUOUS,0};
+    save_reading();
     close_document();
-    viewer.pdf = document;
-    viewer.pages = pages;
-    viewer.page_count = count;
-    viewer.zoom = position.zoom;
-    viewer.fit_width = position.fit_width;
-    viewer.message_until = 0;
-    viewer.menu = MENU_NONE;
-    snprintf(viewer.title, sizeof viewer.title, "%s", name);
-    int page = position.location.page;
-    if (viewer.crop && select_page(page)) {
-        pages[page].crop = pdf_content_bounds(document);
-        pages[page].crop_ready = true;
-    }
+    viewer.worker=worker;viewer.pdf=document;viewer.source=*file;
+    viewer.pages=pages;viewer.page_count=count;viewer.page=position.location.page;
+    viewer.zoom=position.zoom;viewer.fit_width=position.fit_width;
+    viewer.view_mode=(ViewMode)position.layout;viewer.rotation=position.rotation;
+    viewer.message_until=0;viewer.menu=MENU_NONE;
+    snprintf(viewer.title,sizeof viewer.title,"%s",file->name[0]?file->name:GetFileName(file->path));
     measure_document();
-    Vector2 point = position.version == 1 ? center(viewer.layout.body) : reading_point();
-    restore_position(position.location, point);
-    reading_record_session(pdf_key(document), name, locator);
+    restore_position(position.location,position.version==1?center(viewer.layout.body):reading_point());
+    char locator[FOLIO_PATH_MAX];platform_file_locator(file,locator,sizeof locator);
+    reading_record_session(pdf_key(document),viewer.title,locator);
     refresh(0);
 }
 
@@ -633,6 +772,7 @@ static const char *input_label(InputKind kind)
         case INPUT_PAGE: return "Go to page";
         case INPUT_PATH: return "Open PDF by path";
         case INPUT_BOOKMARK: return viewer.bookmark_edit ? "Rename bookmark" : "Name bookmark";
+        case INPUT_FIND: return "Find in document";
         default: return "";
     }
 }
@@ -649,43 +789,23 @@ static void request_input(InputKind kind, const char *initial)
 
 static void open_pdf(const FileEvent *event)
 {
-    bool resuming = viewer.resuming;
-    viewer.resuming = false;
-    if (event->error[0] != '\0') {
-        set_message(event->error);
-        return;
+    if(event->error[0]) { set_message(event->error);return; }
+    if(!event->path[0]) return;
+    if(viewer.input_kind!=INPUT_NONE) {
+        platform_remove_temp(event);set_message("Finish the open dialog before switching PDFs.");return;
     }
-    if (event->path[0] == '\0') return;
-    if (viewer.input_kind != INPUT_NONE) {
-        platform_remove_temp(event);
-        set_message("Finish the open dialog before switching PDFs.");
-        return;
+    if(viewer.opening) {
+        worker_close(viewer.opening);
+        platform_remove_temp(&viewer.opening_file);
     }
-
-    char error[256];
-    Pdf *document = pdf_open(event->path, error, sizeof error);
-    platform_remove_temp(event);
-    if (document == NULL) {
-        set_message(resuming ? "This PDF is unavailable. Open it again to resume." : error);
-        return;
-    }
-    if (resuming && pdf_key(document) != viewer.resume_document) {
-        pdf_close(document);
-        set_message("Choose the same PDF to resume this session.");
-        return;
-    }
-    const char *name = event->name[0] != '\0' ? event->name : GetFileName(event->path);
-    char locator[FOLIO_PATH_MAX];
-    platform_file_locator(event, locator, sizeof locator);
-    if (pdf_locked(document)) {
-        pdf_close(viewer.locked);
-        viewer.locked = document;
-        snprintf(viewer.pending_title, sizeof viewer.pending_title, "%s", name);
-        snprintf(viewer.pending_locator, sizeof viewer.pending_locator, "%s", locator);
-        request_input(INPUT_PASSWORD, "");
-    } else {
-        use_document(document, name, locator);
-    }
+    viewer.input_kind=INPUT_NONE;viewer.system_input=false;
+    viewer.opening=worker_open(event->path);
+    if(!viewer.opening) { platform_remove_temp(event);set_message("Could not start loading this PDF.");return; }
+    viewer.opening_file=*event;
+    viewer.password_requested=false;
+    viewer.opening_done=viewer.opening_total=0;
+    memset(viewer.opening_password,0,sizeof viewer.opening_password);
+    viewer.menu=MENU_NONE;
 }
 
 static void show_reading_menu(ReadingTab tab, bool context);
@@ -695,19 +815,23 @@ static void finish_input(const char *value, bool accepted)
     InputKind kind = viewer.input_kind;
     viewer.input_kind = INPUT_NONE;
     viewer.system_input = false;
-    if (accepted && kind == INPUT_PASSWORD) {
-        char error[256];
-        if (pdf_unlock(viewer.locked, value, error, sizeof error)) {
-            Pdf *document = viewer.locked;
-            viewer.locked = NULL;
-            use_document(document, viewer.pending_title, viewer.pending_locator);
-        } else {
-            set_message(error);
-            request_input(INPUT_PASSWORD, "");
+    if(kind==INPUT_PASSWORD) {
+        if(viewer.opening) {
+            if(accepted) {
+                snprintf(viewer.opening_password,sizeof viewer.opening_password,"%s",value);
+                viewer.password_requested=false;
+                worker_password(viewer.opening,value);
+            } else {
+                worker_close(viewer.opening);viewer.opening=NULL;
+                platform_remove_temp(&viewer.opening_file);
+            }
         }
-    } else if (kind == INPUT_PASSWORD) {
-        pdf_close(viewer.locked);
-        viewer.locked = NULL;
+    } else if(accepted&&kind==INPUT_FIND) {
+        snprintf(viewer.query,sizeof viewer.query,"%s",value);
+        viewer.search_open=true;
+        viewer.search_index=-1;viewer.search_auto_jump=true;
+        worker_search_free(&viewer.search);
+        worker_search(viewer.worker,viewer.query);
     } else if (accepted && kind == INPUT_PAGE) {
         char *end;
         long page = strtol(value, &end, 10);
@@ -753,6 +877,7 @@ static void pan_by(float x, float y)
 static void fit(bool width)
 {
     viewer.fit_width = width;
+    viewer.search_index=-1;
     viewer.zoom = 1;
     measure_document();
     show_page(viewer.page);
@@ -824,17 +949,27 @@ static void pointer_update(void)
 {
     Pointer *p = &viewer.pointer;
     int touches = GetTouchPointCount();
-    bool down = touches > 0 || IsMouseButtonDown(MOUSE_BUTTON_LEFT);
+    p->touches=touches;
+    bool down=touches>0||IsMouseButtonDown(MOUSE_BUTTON_LEFT)||IsMouseButtonDown(MOUSE_BUTTON_MIDDLE);
     Vector2 position = touches > 0 ? GetTouchPosition(0) : GetMousePosition();
     p->pressed = down && !p->down;
     p->released = !down && p->down;
     if (!p->released || touches > 0) p->point = position;
+    viewer.wheel = GetMouseWheelMoveV();
+    ScrollEvent scroll;
+    if (platform_poll_scroll(&scroll)) {
+        viewer.wheel = Vector2Add(viewer.wheel, (Vector2){scroll.horizontal, scroll.vertical});
+        p->point = (Vector2){scroll.x * viewer.layout.width, scroll.y * viewer.layout.height};
+    }
     p->down = down;
     if (p->pressed) {
         p->start = p->point;
         p->previous = p->point;
         p->moved = false;
+        p->began=GetTime();
+        viewer.focus_id=0;
     }
+    p->delta = Vector2Subtract(p->point, p->previous);
 
     bool reading = viewer.pdf != NULL && viewer.input_kind == INPUT_NONE && viewer.menu == MENU_NONE;
     if (!reading || touches >= 2) viewer.scrollbar.active = false;
@@ -848,6 +983,9 @@ static void pointer_update(void)
         p->pinch = false;
         p->previous = p->point;
         return;
+    }
+    if(reading&&touches<2&&selection_pointer()) {
+        p->previous=p->point;return;
     }
     if (reading && touches >= 2) {
         Vector2 second = GetTouchPosition(1);
@@ -893,7 +1031,10 @@ static void update_modal(void)
         viewer.input[length] = '\0';
         viewer.input_replace = false;
     }
-    bool control = IsKeyDown(KEY_LEFT_CONTROL) || IsKeyDown(KEY_RIGHT_CONTROL);
+    bool control=IsKeyDown(KEY_LEFT_CONTROL)||IsKeyDown(KEY_RIGHT_CONTROL);
+#if defined(__APPLE__)
+    control=control||IsKeyDown(KEY_LEFT_SUPER)||IsKeyDown(KEY_RIGHT_SUPER);
+#endif
     if (control && IsKeyPressed(KEY_V)) {
         const char *text = GetClipboardText();
         if (text != NULL) {
@@ -902,7 +1043,7 @@ static void update_modal(void)
         }
     }
     if (control && IsKeyPressed(KEY_A)) viewer.input_replace = true;
-    if (IsKeyPressed(KEY_ESCAPE) || clicked(viewer.layout.cancel)) finish_input("", false);
+    if (back_pressed() || clicked(viewer.layout.cancel)) finish_input("", false);
     else if (IsKeyPressed(KEY_ENTER) || IsKeyPressed(KEY_KP_ENTER) || clicked(viewer.layout.confirm))
         finish_input(viewer.input, true);
 }
@@ -938,42 +1079,64 @@ static void update_theme_menu(void)
     if (IsKeyPressed(KEY_UP)) viewer.theme_cursor = (viewer.theme_cursor + THEME_COUNT - 1) % THEME_COUNT;
     if (IsKeyPressed(KEY_DOWN)) viewer.theme_cursor = (viewer.theme_cursor + 1) % THEME_COUNT;
     if (IsKeyPressed(KEY_ENTER) || IsKeyPressed(KEY_KP_ENTER)) select_theme(viewer.theme_cursor);
-    else if (IsKeyPressed(KEY_ESCAPE) ||
+    else if (back_pressed() ||
         (viewer.pointer.released && !contains(l.theme_popup, viewer.pointer.start))) viewer.menu = MENU_NONE;
+}
+
+static bool view_clicked(Rectangle target)
+{
+    Pointer *p=&viewer.pointer;
+    return contains(viewer.layout.popup,p->start)&&contains(viewer.layout.popup,p->point)&&clicked(target);
 }
 
 static void update_view_menu(void)
 {
-    Layout l = viewer.layout;
-    if (clicked(l.view_theme)) {
-        open_theme_menu(MENU_THEME_TOP);
-        return;
+    Layout l=viewer.layout;Pointer *p=&viewer.pointer;
+    float maximum=maxf(0,425*l.ui-l.popup.height);
+    if(IsKeyPressed(KEY_PAGE_DOWN)||IsKeyPressed(KEY_PAGE_UP)||IsKeyPressed(KEY_HOME)||IsKeyPressed(KEY_END)) {
+        float offset=IsKeyPressed(KEY_PAGE_DOWN)?l.popup.height*.8f:IsKeyPressed(KEY_PAGE_UP)?-l.popup.height*.8f:0;
+        viewer.view_scroll=Clamp(viewer.view_scroll+offset,0,maximum);
+        if(IsKeyPressed(KEY_HOME)) viewer.view_scroll=0;
+        if(IsKeyPressed(KEY_END)) viewer.view_scroll=maximum;
+        viewer.layout=layout();return;
     }
-    if ((viewer.pointer.down || viewer.pointer.released) && contains(l.brightness, viewer.pointer.start)) {
-        float value = (viewer.pointer.point.x - l.brightness.x) / l.brightness.width;
-        viewer.brightness = 0.4f + 0.6f * Clamp(value, 0, 1);
-        if (viewer.pointer.released) save_settings();
+    if(p->down&&contains(l.popup,p->start)&&!contains(l.brightness,p->start)) {
+        if(Vector2Distance(p->start,p->point)>5*l.ui) p->moved=true;
+        if(p->moved) {viewer.view_scroll=Clamp(viewer.view_scroll-p->delta.y,0,maximum);viewer.layout=layout();return;}
     }
-    if (clicked(l.crop)) {
-        viewer.crop = !viewer.crop;
-        if (viewer.pdf != NULL) {
-            ReadingPosition anchor = position_at(reading_point());
-            measure_document();
-            restore_position(anchor, reading_point());
-            refresh(0);
-        }
-        save_settings();
+    if(contains(l.popup,p->point)&&viewer.wheel.y!=0) {
+        viewer.view_scroll=Clamp(viewer.view_scroll-viewer.wheel.y*60*l.ui,0,maximum);
+        viewer.layout=layout();return;
     }
-    if (clicked(l.focus) && viewer.pdf != NULL) {
-        viewer.focused = true;
-        viewer.menu = MENU_NONE;
+    viewer.view_scroll=Clamp(viewer.view_scroll,0,maximum);
+    if(view_clicked(l.view_theme)) {open_theme_menu(MENU_THEME_TOP);return;}
+    if((p->down||p->released)&&contains(l.brightness,p->start)&&contains(l.popup,p->point)) {
+        viewer.brightness=.4f+.6f*Clamp((p->point.x-l.brightness.x)/l.brightness.width,0,1);
+        if(p->released) save_settings();
     }
-    if (IsKeyPressed(KEY_ESCAPE) ||
-        (viewer.pointer.released && !contains(l.popup, viewer.pointer.start))) viewer.menu = MENU_NONE;
+    if(view_clicked(l.brightness_less)||view_clicked(l.brightness_more)) {
+        viewer.brightness=Clamp(viewer.brightness+(view_clicked(l.brightness_more)?.1f:-.1f),.4f,1);
+        save_settings();return;
+    }
+    if(view_clicked(l.crop)) {
+        viewer.crop=!viewer.crop;
+        if(viewer.pdf) {ReadingPosition anchor=position_at(reading_point());measure_document();restore_position(anchor,reading_point());refresh(0);}
+        save_settings();return;
+    }
+    if(view_clicked(l.focus)&&viewer.pdf) {viewer.focused=true;viewer.menu=MENU_NONE;return;}
+    for(int i=0;i<3;i++) if(view_clicked(l.modes[i])) {set_view_mode((ViewMode)i);return;}
+    if(view_clicked(l.rotate_left)) {rotate_document(-1);return;}
+    if(view_clicked(l.rotate_right)) {rotate_document(1);return;}
+    if(view_clicked(l.history_back)) {history_move(-1);return;}
+    if(view_clicked(l.history_forward)) {history_move(1);return;}
+    if(view_clicked(l.print)) {document_action(PLATFORM_PRINT);return;}
+    if(view_clicked(l.share)) {document_action(PLATFORM_SHARE);return;}
+    if(view_clicked(l.export_copy)) {document_action(PLATFORM_EXPORT);return;}
+    if(back_pressed()||(p->released&&!contains(l.popup,p->start))) viewer.menu=MENU_NONE;
 }
 
 typedef struct {
-    Rectangle panel, tabs[READING_TAB_COUNT], add, previous, next;
+    Rectangle panel, list, tabs[READING_TAB_COUNT], add, previous, next;
     float row_y, row_height;
     size_t slots;
 } ReadingLayout;
@@ -984,6 +1147,7 @@ static size_t reading_item_count(void)
         case READING_CONTENTS: return viewer.reading.visible_count;
         case READING_BOOKMARKS: return viewer.reading.bookmark_count;
         case READING_RECENT: return viewer.reading.session_count;
+        case READING_THUMBNAILS: return viewer.pdf?(size_t)viewer.page_count:0;
         default: return 0;
     }
 }
@@ -998,7 +1162,7 @@ static ReadingLayout reading_layout(void)
     size_t count = reading_item_count();
     float max_height = minf(432 * u, maxf(142 * u, l.body.height - 2 * margin));
     float header = (bookmarks ? 100 : 54) * u;
-    float row_height = (viewer.reading.tab == READING_CONTENTS ? 44 : 51) * u;
+    float row_height=(viewer.reading.tab==READING_THUMBNAILS?100:viewer.reading.tab==READING_CONTENTS?44:51)*u;
     size_t slots = (size_t)maxf(1, floorf((max_height - header - 39 * u) / row_height));
     size_t rows = count == 0 ? 1 : count < slots ? count : slots;
     float height = minf(max_height, header + rows * row_height + (count > slots ? 39 : 8) * u);
@@ -1019,6 +1183,7 @@ static ReadingLayout reading_layout(void)
     float footer = y + height - 39 * u;
     ReadingLayout layout = {
         .panel = rect(x, y, width, height),
+        .list = rect(x + margin, row_y, inner, rows * row_height),
         .add = add,
         .previous = rect(x + margin, footer, 38 * u, 32 * u),
         .next = rect(x + width - margin - 38 * u, footer, 38 * u, 32 * u),
@@ -1045,7 +1210,7 @@ static void load_contents(void)
 {
     ReadingMenu *menu = &viewer.reading;
     if (viewer.pdf == NULL || menu->contents_status != CONTENTS_UNREAD) return;
-    if (!pdf_load_contents(viewer.pdf, &menu->contents, NULL, 0)) {
+    if (!worker_contents(viewer.worker, &menu->contents)) {
         menu->contents_status = CONTENTS_FAILED;
         return;
     }
@@ -1065,13 +1230,16 @@ static void load_reading_menu(ReadingTab tab)
 {
     ReadingMenu *menu = &viewer.reading;
     menu->tab = tab;
-    menu->start = 0;
+    menu->scroll = 0;
     menu->selected = 0;
     menu->scrollbar.active = false;
     if (tab == READING_CONTENTS) {
         load_contents();
     } else if (tab == READING_RECENT) {
         menu->session_count = reading_load_sessions(menu->sessions, RECENT_LIMIT);
+    } else if(tab==READING_THUMBNAILS) {
+        menu->selected=viewer.page;
+        menu->scroll=viewer.page;
     } else {
         free(menu->bookmarks);
         menu->bookmarks = NULL;
@@ -1095,7 +1263,7 @@ static void show_reading_menu(ReadingTab tab, bool context)
 
 static size_t reading_item_end(ReadingLayout layout)
 {
-    size_t end = viewer.reading.start + layout.slots;
+    size_t end = (size_t)ceil(viewer.reading.scroll + layout.slots);
     size_t count = reading_item_count();
     return end < count ? end : count;
 }
@@ -1104,7 +1272,7 @@ static Rectangle reading_row(ReadingLayout layout, size_t index)
 {
     float u = viewer.layout.ui;
     float scrollbar_space = reading_item_count() > layout.slots ? 14 * u : 0;
-    return rect(layout.panel.x + 8 * u, layout.row_y + (index - viewer.reading.start) * layout.row_height,
+    return rect(layout.panel.x + 8 * u, layout.row_y + (float)(index - viewer.reading.scroll) * layout.row_height,
                 layout.panel.width - 16 * u - scrollbar_space, layout.row_height - 4 * u);
 }
 
@@ -1113,7 +1281,7 @@ static Scrollbar reading_scrollbar(ReadingLayout layout)
     float u = viewer.layout.ui;
     Rectangle track = rect(layout.panel.x + layout.panel.width - 20 * u, layout.row_y, 14 * u,
                            layout.row_height * layout.slots - 4 * u);
-    return scrollbar_geometry(track, (double)viewer.reading.start,
+    return scrollbar_geometry(track, viewer.reading.scroll,
                               (double)reading_item_count(), (double)layout.slots);
 }
 
@@ -1154,11 +1322,6 @@ static void jump_to_contents(size_t row)
 
     int index = entry->page;
     ReadingPage *page = &viewer.pages[index];
-    if (viewer.crop && !page->crop_ready && select_page(index)) {
-        page->crop = pdf_content_bounds(viewer.pdf);
-        page->crop_ready = true;
-        measure_document();
-    }
     PdfBox bounds = reading_bounds(page);
     double y = isfinite(entry->y) ? Clamp((entry->y - bounds.y0) / (bounds.y1 - bounds.y0), 0, 1) : 0;
     double x = 0.5;
@@ -1167,7 +1330,10 @@ static void jump_to_contents(size_t row)
         x = Clamp((entry->x - bounds.x0) / (bounds.x1 - bounds.x0), 0, 1);
         anchor.x = viewer.layout.body.x + page_margin();
     }
-    restore_position((ReadingPosition){index, x, y}, anchor);
+    history_push();
+    viewer.page=index;
+    restore_position((ReadingPosition){index,x,y},anchor);
+    viewer.page=index;
     viewer.menu = MENU_NONE;
     refresh(0);
 }
@@ -1240,14 +1406,20 @@ static void resume_session(const RecentSession *session)
 
 static void open_reading_item(size_t index)
 {
-    if (viewer.reading.tab == READING_CONTENTS) {
+    if(viewer.reading.tab==READING_THUMBNAILS) {
+        show_page((int)index);viewer.menu=MENU_NONE;
+    } else if (viewer.reading.tab == READING_CONTENTS) {
         jump_to_contents(index);
     } else if (viewer.reading.tab == READING_RECENT) {
         resume_session(&viewer.reading.sessions[index]);
     } else {
         SavedPosition position = viewer.reading.bookmarks[index].position;
-        viewer.fit_width = position.fit_width;
-        viewer.zoom = position.zoom;
+        history_push();
+        viewer.fit_width=position.fit_width;
+        viewer.zoom=position.zoom;
+        viewer.view_mode=(ViewMode)position.layout;
+        viewer.rotation=position.rotation;
+        viewer.page=position.location.page;
         measure_document();
         restore_position(position.location, reading_point());
         viewer.menu = MENU_NONE;
@@ -1270,11 +1442,20 @@ static void delete_reading_item(size_t index)
                                                  : "Could not remove the recent document.");
         return;
     }
-    size_t start = menu->start;
+    double scroll = menu->scroll;
     load_reading_menu(menu->tab);
     size_t count = reading_item_count();
     menu->selected = count == 0 ? 0 : index < count ? index : count - 1;
-    menu->start = start < menu->selected ? start : menu->selected;
+    menu->scroll = scroll;
+}
+
+static void clamp_reading_scroll(size_t slots)
+{
+    ReadingMenu *menu = &viewer.reading;
+    size_t count = reading_item_count();
+    double maximum = count > slots ? (double)(count - slots) : 0;
+    menu->scroll = fmax(0, fmin(maximum, menu->scroll));
+    menu->selected = count == 0 ? 0 : menu->selected < count ? menu->selected : count - 1;
 }
 
 static void select_reading_item(size_t index, size_t slots)
@@ -1283,10 +1464,9 @@ static void select_reading_item(size_t index, size_t slots)
     size_t count = reading_item_count();
     if (count == 0) return;
     menu->selected = index < count ? index : count - 1;
-    if (menu->selected < menu->start) menu->start = menu->selected;
-    else if (menu->selected - menu->start >= slots) menu->start = menu->selected - slots + 1;
-    size_t maximum = count > slots ? count - slots : 0;
-    if (menu->start > maximum) menu->start = maximum;
+    if (menu->selected < menu->scroll) menu->scroll = (double)menu->selected;
+    else if (menu->selected + 1 > menu->scroll + slots) menu->scroll = (double)(menu->selected + 1 - slots);
+    clamp_reading_scroll(slots);
 }
 
 static void navigate_contents_tree(size_t slots)
@@ -1312,7 +1492,7 @@ static void update_reading_menu(void)
 {
     ReadingMenu *menu = &viewer.reading;
     ReadingLayout layout = reading_layout();
-    if (IsKeyPressed(KEY_ESCAPE) ||
+    if (back_pressed() ||
         (viewer.pointer.released && !contains(layout.panel, viewer.pointer.start))) {
         viewer.menu = MENU_NONE;
         return;
@@ -1323,7 +1503,7 @@ static void update_reading_menu(void)
             return;
         }
     }
-    if (IsKeyPressed(KEY_TAB)) {
+    if (IsKeyDown(KEY_LEFT_CONTROL)&&IsKeyPressed(KEY_TAB)) {
         load_reading_menu((ReadingTab)((menu->tab + 1) % READING_TAB_COUNT));
         return;
     }
@@ -1334,16 +1514,36 @@ static void update_reading_menu(void)
 
     size_t count = reading_item_count();
     if (count == 0) return;
-    select_reading_item(menu->selected, layout.slots);
+    clamp_reading_scroll(layout.slots);
     double offset;
     if (drag_scrollbar(reading_scrollbar(layout), &menu->scrollbar, &offset)) {
-        menu->start = (size_t)(offset + 0.5);
-        menu->selected = menu->start;
+        menu->scroll = offset;
         return;
     }
+
+    Pointer *p = &viewer.pointer;
+    if (p->down && contains(layout.list, p->start)) {
+        if (Vector2Distance(p->start, p->point) > 5 * viewer.layout.ui) p->moved = true;
+        if (p->moved) {
+            menu->scroll -= p->delta.y / layout.row_height;
+            clamp_reading_scroll(layout.slots);
+            return;
+        }
+    }
+    float wheel = contains(layout.panel, p->point) ? viewer.wheel.y : 0;
+    if (wheel != 0) {
+        menu->scroll -= wheel * wheel_scroll_distance * viewer.layout.ui / layout.row_height;
+        clamp_reading_scroll(layout.slots);
+    }
     size_t end = reading_item_end(layout);
-    for (size_t i = menu->start; i < end; i++) {
+    for (size_t i = (size_t)menu->scroll; i < end; i++) {
         Rectangle row = reading_row(layout, i);
+        // Partially visible rows must not receive clicks through the tabs or footer.
+        if (!contains(layout.list, p->start) || !contains(layout.list, p->point)) continue;
+        if(menu->tab==READING_THUMBNAILS) {
+            if(clicked(row)) {open_reading_item(i);return;}
+            continue;
+        }
         if (menu->tab == READING_CONTENTS) {
             if (contents_branch(i) && clicked(contents_disclosure(row, contents_entry(i)))) {
                 toggle_contents_branch(i);
@@ -1370,34 +1570,42 @@ static void update_reading_menu(void)
         }
     }
 
-    if (clicked(layout.previous) && menu->start > 0) {
-        menu->start = menu->start > layout.slots ? menu->start - layout.slots : 0;
-        menu->selected = menu->start;
+    if (count > layout.slots && clicked(layout.previous)) {
+        menu->scroll -= layout.slots;
+        clamp_reading_scroll(layout.slots);
     } else if (clicked(layout.next) && end < count) {
-        menu->start = end;
-        select_reading_item(end, layout.slots);
+        menu->scroll += layout.slots;
+        clamp_reading_scroll(layout.slots);
     }
 
-    float wheel = contains(layout.panel, viewer.pointer.point) ? GetMouseWheelMove() : 0;
-    if ((wheel > 0 || IsKeyPressed(KEY_UP) || IsKeyPressedRepeat(KEY_UP)) && menu->selected > 0)
+    if ((IsKeyPressed(KEY_UP) || IsKeyPressedRepeat(KEY_UP)) && menu->selected > 0)
         select_reading_item(menu->selected - 1, layout.slots);
-    else if (wheel < 0 || IsKeyPressed(KEY_DOWN) || IsKeyPressedRepeat(KEY_DOWN))
+    else if (IsKeyPressed(KEY_DOWN) || IsKeyPressedRepeat(KEY_DOWN))
         select_reading_item(menu->selected + 1, layout.slots);
 
     if (IsKeyPressed(KEY_ENTER) || IsKeyPressed(KEY_KP_ENTER)) open_reading_item(menu->selected);
     else if (menu->tab == READING_CONTENTS) navigate_contents_tree(layout.slots);
-    else if (IsKeyPressed(KEY_DELETE)) delete_reading_item(menu->selected);
+    else if(menu->tab!=READING_THUMBNAILS&&IsKeyPressed(KEY_DELETE)) delete_reading_item(menu->selected);
 }
 
 static void update_controls(void)
 {
     Layout l = viewer.layout;
+    if(viewer.menu==MENU_NONE&&viewer.input_kind==INPUT_NONE&&viewer.selection.active&&clicked(selection_copy_box())) {copy_selection();return;}
     if (viewer.input_kind != INPUT_NONE) {
         update_modal();
         return;
     }
 
-    bool control = IsKeyDown(KEY_LEFT_CONTROL) || IsKeyDown(KEY_RIGHT_CONTROL);
+    bool control=IsKeyDown(KEY_LEFT_CONTROL)||IsKeyDown(KEY_RIGHT_CONTROL);
+#if defined(__APPLE__)
+    control=control||IsKeyDown(KEY_LEFT_SUPER)||IsKeyDown(KEY_RIGHT_SUPER);
+#endif
+    if(viewer.opening&&(clicked(l.loading_cancel)||back_pressed())) {
+        worker_close(viewer.opening);viewer.opening=NULL;
+        platform_remove_temp(&viewer.opening_file);set_message("Loading canceled.");return;
+    }
+    if(viewer.pdf&&((control&&IsKeyPressed(KEY_F))||clicked(l.find))) { begin_find();return; }
     if ((control && IsKeyPressed(KEY_O)) || (!viewer.focused && clicked(l.open))) {
         choose_new_pdf();
         return;
@@ -1425,6 +1633,7 @@ static void update_controls(void)
                                false);
         return;
     }
+    if(!control&&IsKeyPressed(KEY_P)) {show_reading_menu(READING_THUMBNAILS,false);return;}
     if (!control && IsKeyPressed(KEY_C)) {
         show_reading_menu(READING_CONTENTS, false);
         return;
@@ -1458,23 +1667,51 @@ static void update_controls(void)
         return;
     }
 
+#if defined(__ANDROID__)
+    if (IsKeyPressed(KEY_BACK)) {
+        if(viewer.selection.active) viewer.selection=(TextSelection){0};
+        else if(viewer.search_open) search_close();
+        else if(viewer.history_cursor>0) history_move(-1);
+        else if(viewer.focused) viewer.focused=false;
+        else viewer.quit=true;
+        return;
+    }
+#endif
+
+    if(viewer.pdf&&control&&IsKeyPressed(KEY_F)) { begin_find();return; }
+    if(viewer.pdf&&control&&IsKeyPressed(KEY_C)) { copy_selection();return; }
+    if(viewer.pdf&&control&&IsKeyPressed(KEY_A)) { select_all_text();return; }
+    if(viewer.pdf&&control&&IsKeyPressed(KEY_P)) { document_action(PLATFORM_PRINT);return; }
+    if(viewer.pdf&&IsKeyPressed(KEY_F3)) { find_next(IsKeyDown(KEY_LEFT_SHIFT)?-1:1);return; }
+    if(viewer.pdf&&(IsKeyDown(KEY_LEFT_ALT)||IsKeyDown(KEY_RIGHT_ALT))) {
+        if(IsKeyPressed(KEY_LEFT)) { history_move(-1);return; }
+        if(IsKeyPressed(KEY_RIGHT)) { history_move(1);return; }
+    }
+    if(viewer.pdf&&back_pressed()&&viewer.selection.active) { viewer.selection=(TextSelection){0};return; }
+    if(viewer.pdf&&viewer.search_open) {
+        if(clicked(l.search_field)) { begin_find();return; }
+        if(clicked(l.search_prev)) { find_next(-1);return; }
+        if(clicked(l.search_next)||IsKeyPressed(KEY_ENTER)) { find_next(1);return; }
+        if(clicked(l.search_close)||back_pressed()) { search_close();return; }
+    }
     if (viewer.pdf == NULL) {
         Rectangle action = rect(l.width * 0.5f - 82 * l.ui, l.height * 0.5f + 12 * l.ui, 164 * l.ui, 48 * l.ui);
         if (clicked(action)) choose_new_pdf();
         return;
     }
 
-    if (IsKeyPressed(KEY_F) || (viewer.focused && IsKeyPressed(KEY_ESCAPE)) ||
-        clicked(l.body)) {
+    if(clicked(l.body)&&follow_link_at(viewer.pointer.point)) return;
+    if(viewer.selection.active&&clicked(l.body)) { viewer.selection=(TextSelection){0};return; }
+    if ((!control&&IsKeyPressed(KEY_F)) || (viewer.focused && back_pressed()) || clicked(l.body)) {
         viewer.focused = !viewer.focused;
         return;
     }
 
     Vector2 origin = center(l.body);
     if ((!viewer.focused && clicked(l.prev)) || IsKeyPressed(KEY_LEFT) || IsKeyPressed(KEY_PAGE_UP))
-        show_page(viewer.page - 1);
+        change_page(-1);
     if ((!viewer.focused && clicked(l.next)) || IsKeyPressed(KEY_RIGHT) || IsKeyPressed(KEY_PAGE_DOWN))
-        show_page(viewer.page + 1);
+        change_page(1);
     if ((!viewer.focused && clicked(l.page)) || (control && IsKeyPressed(KEY_G))) go_to_page();
     if ((!viewer.focused && clicked(l.fit)) || IsKeyPressed(KEY_W)) fit(!viewer.fit_width);
     if (IsKeyPressed(KEY_ZERO)) fit(false);
@@ -1485,7 +1722,7 @@ static void update_controls(void)
     if (IsKeyPressed(KEY_UP) || IsKeyPressedRepeat(KEY_UP)) pan_by(0, 36 * l.ui);
     if (IsKeyPressed(KEY_DOWN) || IsKeyPressedRepeat(KEY_DOWN)) pan_by(0, -36 * l.ui);
 
-    Vector2 scroll = GetMouseWheelMoveV();
+    Vector2 scroll = viewer.wheel;
     if (contains(l.body, viewer.pointer.point) && (scroll.x != 0 || scroll.y != 0)) {
         if (control) zoom_at(powf(1.18f, scroll.y), viewer.pointer.point, viewer.pointer.point);
         else pan_by(scroll.x * 88 * l.ui, scroll.y * wheel_scroll_distance * l.ui);
@@ -1517,6 +1754,7 @@ static void button_label(Rectangle target, const char *text, Color color)
 static void button(Rectangle target, const char *text, bool active, bool enabled)
 {
     const Palette *palette = &palettes[viewer.theme];
+    register_element(target,text,enabled,active,false);
     Color fill = palette->button;
     if (active) fill = palette->accent;
     else if (enabled && contains(target, viewer.pointer.point)) fill = palette->hover;
@@ -1549,9 +1787,14 @@ static void draw_texture(PageTexture layer, PdfBox crop, Rectangle page, float s
     if (width <= 0 || height <= 0) return;
     Rectangle source = rect((area.x0 - layer.area.x0) * layer.scale, (area.y0 - layer.area.y0) * layer.scale,
                             width * layer.scale, height * layer.scale);
-    Rectangle target = rect(page.x + (area.x0 - crop.x0) * scale, page.y + (area.y0 - crop.y0) * scale,
-                            width * scale, height * scale);
-    DrawTexturePro(layer.texture, source, target, (Vector2){0}, 0, WHITE);
+    float x=area.x0-crop.x0,y=area.y0-crop.y0;
+    float w=crop.x1-crop.x0,h=crop.y1-crop.y0;
+    Vector2 anchor={x,y};
+    if(viewer.rotation==1) anchor=(Vector2){h-y,x};
+    else if(viewer.rotation==2) anchor=(Vector2){w-x,h-y};
+    else if(viewer.rotation==3) anchor=(Vector2){y,w-x};
+    Rectangle target=rect(page.x+anchor.x*scale,page.y+anchor.y*scale,width*scale,height*scale);
+    DrawTexturePro(layer.texture,source,target,(Vector2){0},90.0f*viewer.rotation,WHITE);
 }
 
 static void draw_document(void)
@@ -1568,8 +1811,12 @@ static void draw_document(void)
         DrawRectangleRec(page, ColorBrightness(palette->paper, (viewer.brightness - 1) * 0.8f));
     }
     int theme = viewer.theme;
+    float paper[] = {palette->paper.r / 255.0f, palette->paper.g / 255.0f, palette->paper.b / 255.0f};
+    float ink[] = {palette->page_ink.r / 255.0f, palette->page_ink.g / 255.0f, palette->page_ink.b / 255.0f};
     SetShaderValue(viewer.shader, viewer.shader_theme, &theme, SHADER_UNIFORM_INT);
     SetShaderValue(viewer.shader, viewer.shader_brightness, &viewer.brightness, SHADER_UNIFORM_FLOAT);
+    SetShaderValue(viewer.shader, viewer.shader_paper, paper, SHADER_UNIFORM_VEC3);
+    SetShaderValue(viewer.shader, viewer.shader_ink, ink, SHADER_UNIFORM_VEC3);
     BeginShaderMode(viewer.shader);
     for (int i = first; i < end; i++) {
         ReadingPage *item = &viewer.pages[i];
@@ -1609,7 +1856,8 @@ static void draw_toolbar(void)
     DrawRectangleRec(rect(0, l.height - l.bar, l.width, l.bar), palette->panel);
     DrawRectangleRec(rect(0, l.height - l.bar, l.width, 1), palette->line);
 
-    button(l.open, l.width < 410 * l.ui ? "Open" : "Open PDF", true, true);
+    button(l.open,l.width<560*l.ui?"Open":"Open PDF",true,true);
+    button(l.find,"Find",viewer.search_open,viewer.pdf!=NULL);
     button(l.reading, "Reading", viewer.menu == MENU_READING, true);
     bool top_theme = viewer.menu == MENU_THEME_TOP;
     button(l.theme, "", top_theme, true);
@@ -1637,10 +1885,13 @@ static void draw_toolbar(void)
     if (viewer.pdf == NULL) return;
     char pages[48];
     int count = pdf_page_count(viewer.pdf);
-    snprintf(pages, sizeof pages, "%d / %d", viewer.page + 1, count);
-    button(l.prev, "<", false, viewer.page > 0);
+    int first=viewer.view_mode==VIEW_SPREAD?viewer.page/2*2:viewer.page;
+    if(viewer.view_mode==VIEW_SPREAD&&first+1<count)
+        snprintf(pages,sizeof pages,"%d-%d / %d",first+1,first+2,count);
+    else snprintf(pages, sizeof pages, "%d / %d", first + 1, count);
+    button(l.prev, "<", false, adjacent_page(-1)>=0);
     button(l.page, pages, false, true);
-    button(l.next, ">", false, viewer.page + 1 < count);
+    button(l.next, ">", false, adjacent_page(1)<count);
     button(l.out, "-", false, true);
     button(l.fit, viewer.fit_width ? "Fit width" : "Fit page", false, true);
     button(l.in, "+", false, true);
@@ -1672,35 +1923,57 @@ static void draw_theme_menu(void)
 
 static void draw_settings(void)
 {
-    Layout l = viewer.layout;
-    const Palette *palette = &palettes[viewer.theme];
-    float u = l.ui;
-    DrawRectangleRounded(l.popup, 0.05f, 6, palette->panel);
-    DrawRectangleLinesEx(l.popup, 1, palette->line);
-    char theme_label[64];
-    snprintf(theme_label, sizeof theme_label, "Theme   %s   >", theme_names[viewer.theme]);
-    button(l.view_theme, theme_label, false, true);
-    label("Page brightness", l.brightness.x, l.brightness.y - 16 * u, 16 * u, palette->muted);
-    float x = l.brightness.x + 6 * u;
-    float y = l.brightness.y + l.brightness.height * 0.5f;
-    float width = l.brightness.width - 12 * u;
-    float active = width * (viewer.brightness - 0.4f) / 0.6f;
-    DrawRectangleRec(rect(x, y - 2 * u, width, 4 * u), palette->line);
-    DrawRectangleRec(rect(x, y - 2 * u, active, 4 * u), palette->accent);
-    DrawCircleV((Vector2){x + active, y}, 7 * u, palette->accent);
-    button(l.crop, viewer.crop ? "Crop margins   On" : "Crop margins   Off", viewer.crop, true);
-    button(l.focus, "Hide toolbar", false, viewer.pdf != NULL);
+    Layout l=viewer.layout;float u=l.ui;
+    const Palette *p=&palettes[viewer.theme];
+    DrawRectangleRounded(l.popup,.05f,6,p->panel);
+    DrawRectangleLinesEx(l.popup,1,p->line);
+    BeginScissorMode((int)l.popup.x,(int)l.popup.y,(int)l.popup.width,(int)l.popup.height);
+    char theme[64];snprintf(theme,sizeof theme,"Theme   %s   >",theme_names[viewer.theme]);
+    button(l.view_theme,theme,false,true);
+    label("Page brightness",l.brightness.x,l.brightness.y-16*u,14*u,p->muted);
+    button(l.brightness_less,"-",false,viewer.brightness>.4f);
+    button(l.brightness_more,"+",false,viewer.brightness<1);
+    float x=l.brightness.x+6*u,y=l.brightness.y+l.brightness.height*.5f,width=l.brightness.width-12*u;
+    float active=width*(viewer.brightness-.4f)/.6f;
+    DrawRectangleRec(rect(x,y-2*u,width,4*u),p->line);
+    DrawRectangleRec(rect(x,y-2*u,active,4*u),p->accent);
+    DrawCircleV((Vector2){x+active,y},7*u,p->accent);
+    button(l.crop,viewer.crop?"Crop margins   On":"Crop margins   Off",viewer.crop,viewer.pdf!=NULL);
+    button(l.focus,"Hide toolbar",false,viewer.pdf!=NULL);
+    const char *modes[]={"Continuous","Single page","Two pages"};
+    for(int i=0;i<3;i++) button(l.modes[i],modes[i],(int)viewer.view_mode==i,viewer.pdf!=NULL);
+    button(l.rotate_left,"Rotate left",false,viewer.pdf!=NULL);
+    button(l.rotate_right,"Rotate right",false,viewer.pdf!=NULL);
+    button(l.history_back,"Back",false,viewer.history_cursor>0);
+    button(l.history_forward,"Forward",false,viewer.history_cursor+1<viewer.history_count);
+    button(l.print,"Print",false,viewer.pdf&&pdf_can_print(viewer.pdf));
+    button(l.share,"Share",false,viewer.pdf!=NULL);
+    button(l.export_copy,"Save a copy",false,viewer.pdf!=NULL);
+    EndScissorMode();
 }
 
-static void draw_contents_row(Rectangle row, size_t index)
+static void clip_reading_row(ReadingLayout layout, Rectangle area)
+{
+    Rectangle clip = GetCollisionRec(layout.list, area);
+    BeginScissorMode((int)ceilf(clip.x), (int)ceilf(clip.y),
+                     (int)maxf(0, floorf(clip.x + clip.width) - ceilf(clip.x)),
+                     (int)maxf(0, floorf(clip.y + clip.height) - ceilf(clip.y)));
+}
+
+static void draw_contents_row(ReadingLayout layout, Rectangle row, size_t index)
 {
     const Palette *palette = &palettes[viewer.theme];
     const PdfContentsEntry *entry = contents_entry(index);
+    char accessible[320];
+    snprintf(accessible,sizeof accessible,"%s, page %d",entry->title,entry->page+1);
+    register_element(GetCollisionRec(layout.list,row),accessible,true,index==viewer.reading.selected,false);
     Rectangle disclosure = contents_disclosure(row, entry);
     float u = viewer.layout.ui;
     bool selected = index == viewer.reading.selected || contains(row, viewer.pointer.point);
     DrawRectangleRounded(row, 0.18f, 6, selected ? palette->hover : palette->button);
     if (contents_branch(index)) {
+        snprintf(accessible,sizeof accessible,"%s %s",entry->expanded?"Collapse":"Expand",entry->title);
+        register_element(GetCollisionRec(layout.list,disclosure),accessible,true,entry->expanded,false);
         Vector2 point = center(disclosure);
         if (entry->expanded) {
             DrawLineEx((Vector2){point.x - 4 * u, point.y - 2 * u}, (Vector2){point.x, point.y + 2 * u}, 1.6f * u, palette->ink);
@@ -1720,7 +1993,7 @@ static void draw_contents_row(Rectangle row, size_t index)
         label(number, end - width, row.y + (row.height - size) * 0.5f, size, palette->muted);
         end -= width + 12 * u;
     }
-    BeginScissorMode((int)title_x, (int)row.y, (int)maxf(1, end - title_x), (int)row.height);
+    clip_reading_row(layout, rect(title_x, row.y, maxf(1, end - title_x), row.height));
     label(entry->title, title_x, row.y + (row.height - 17 * u) * 0.5f, 17 * u,
           entry->page >= 0 || contents_branch(index) ? palette->ink : palette->muted);
     EndScissorMode();
@@ -1747,7 +2020,7 @@ static void draw_reading_menu(void)
     float u = viewer.layout.ui;
     DrawRectangleRounded(layout.panel, 0.08f, 6, palette->panel);
     DrawRectangleLinesEx(layout.panel, 1, palette->line);
-    const char *tabs[] = {"Contents", "Bookmarks", "Recent"};
+    const char *tabs[]={"Contents","Bookmarks","Recent","Pages"};
     for (int i = 0; i < READING_TAB_COUNT; i++)
         button(layout.tabs[i], tabs[i], menu->tab == (ReadingTab)i, true);
     if (menu->tab == READING_BOOKMARKS && viewer.pdf != NULL) {
@@ -1763,10 +2036,14 @@ static void draw_reading_menu(void)
     }
 
     size_t end = reading_item_end(layout);
-    for (size_t i = menu->start; i < end; i++) {
+    for (size_t i = (size_t)menu->scroll; i < end; i++) {
         Rectangle row = reading_row(layout, i);
+        clip_reading_row(layout, row);
+        if(menu->tab==READING_THUMBNAILS) {
+            draw_thumbnail_row(row,i);EndScissorMode();continue;
+        }
         if (menu->tab == READING_CONTENTS) {
-            draw_contents_row(row, i);
+            draw_contents_row(layout, row, i);
             continue;
         }
         Rectangle item = reading_item(row);
@@ -1785,20 +2062,22 @@ static void draw_reading_menu(void)
         char number[48];
         snprintf(number, sizeof number, "Page %d", page + 1);
         float inset = 10 * u;
-        BeginScissorMode((int)(item.x + inset), (int)item.y, (int)maxf(1, item.width - 2 * inset), (int)item.height);
+        clip_reading_row(layout, rect(item.x + inset, item.y, maxf(1, item.width - 2 * inset), item.height));
         label(title, item.x + inset, item.y + 4 * u, 17 * u, palette->ink);
         label(number, item.x + inset, item.y + 26 * u, 14 * u, palette->muted);
         EndScissorMode();
+        clip_reading_row(layout, row);
         if (menu->tab == READING_BOOKMARKS) button(reading_edit(row), "Edit", false, true);
         button(reading_remove(row), menu->tab == READING_BOOKMARKS ? "Remove" : "Forget", false, true);
+        EndScissorMode();
     }
 
     if (count > layout.slots) {
         draw_scrollbar(reading_scrollbar(layout), menu->scrollbar);
-        button(layout.previous, "<", false, menu->start > 0);
+        button(layout.previous, "<", false, menu->scroll > 0);
         button(layout.next, ">", false, end < count);
         char range[64];
-        snprintf(range, sizeof range, "%zu-%zu of %zu", menu->start + 1, end, count);
+        snprintf(range, sizeof range, "%zu-%zu of %zu", (size_t)menu->scroll + 1, end, count);
         centered(range, rect(layout.panel.x, layout.previous.y, layout.panel.width, layout.previous.height),
                  14 * u, palette->muted);
     }
@@ -1806,6 +2085,7 @@ static void draw_reading_menu(void)
 
 static void draw_modal(void)
 {
+    if(viewer.system_input) return;
     Layout l = viewer.layout;
     const Palette *palette = &palettes[viewer.theme];
     DrawRectangleRec(rect(0, 0, l.width, l.height), Fade(BLACK, 0.4f));
@@ -1850,9 +2130,15 @@ static void draw_message(void)
     EndScissorMode();
 }
 
+#include "reader_features.inc"
+
 static void frame(void)
 {
+    if(!platform_frame_ready()) {PollInputEvents();return;}
     update_layout();
+    char notice[320];if(platform_poll_notice(notice,sizeof notice)) set_message(notice);
+    update_loading();
+    if(viewer.worker) { worker_tick(viewer.worker);update_document_work();update_search(); }
     FileEvent file;
     if (platform_poll_file(&file)) open_pdf(&file);
     TextEvent text;
@@ -1872,6 +2158,8 @@ static void frame(void)
 #endif
 
     pointer_update();
+    update_commands();
+    update_keyboard_focus();
     if (!completed_text) update_controls();
     if (viewer.pdf != NULL) update_visible_pages();
     if (viewer.save_due >= 0 && (GetTime() >= viewer.save_due || !IsWindowFocused())) {
@@ -1879,6 +2167,7 @@ static void frame(void)
         viewer.save_due = -1;
     }
 
+    viewer.element_count=0;
     BeginDrawing();
     ClearBackground(palettes[viewer.theme].background);
     if (viewer.pdf == NULL) draw_empty();
@@ -1887,11 +2176,18 @@ static void frame(void)
         draw_scrollbar(document_scrollbar(), viewer.scrollbar);
     }
     if (!viewer.focused) draw_toolbar();
+    if(viewer.search_open) draw_search();
+    if(viewer.pdf) draw_interaction();
+    viewer.building_menu=true;
     if (viewer.menu == MENU_VIEW) draw_settings();
     if (theme_menu_open()) draw_theme_menu();
     if (viewer.menu == MENU_READING) draw_reading_menu();
     if (viewer.input_kind != INPUT_NONE) draw_modal();
+    viewer.building_menu=false;
     draw_message();
+    if(viewer.opening) draw_loading();
+    draw_focus();
+    publish_accessibility();
     EndDrawing();
 }
 
@@ -1910,30 +2206,34 @@ static const char *page_shader =
     "uniform sampler2D texture0;\n"
     "uniform int readingTheme;\n"
     "uniform float brightness;\n"
+    "uniform vec3 paperColor;\n"
+    "uniform vec3 inkColor;\n"
     "void main() {\n"
     "  vec3 ink = " SHADER_SAMPLE "(texture0, fragTexCoord).rgb;\n"
     "  float l = dot(ink, vec3(0.2126, 0.7152, 0.0722));\n"
     "  float sat = max(max(ink.r, ink.g), ink.b) - min(min(ink.r, ink.g), ink.b);\n"
     "  float color = smoothstep(0.04, 0.4, sat);\n"
     "  vec3 tinted = ink;\n"
-    "  if (readingTheme == 1) {\n"
-    "    tinted = mix(vec3(0.17, 0.13, 0.09), vec3(0.976, 0.925, 0.82), l);\n"
-    "    tinted = mix(tinted, ink, color * 0.75);\n"
-    "  } else if (readingTheme == 2) {\n"
-    "    tinted = mix(vec3(0.91, 0.92, 0.94), vec3(0.125, 0.137, 0.165), l);\n"
-    "    tinted = mix(tinted, mix(ink, vec3(l), 0.16), color * 0.72);\n"
+    "  if (readingTheme != 0) {\n"
+    "    tinted = mix(inkColor, paperColor, l);\n"
+    "    bool night = dot(paperColor, vec3(0.2126, 0.7152, 0.0722)) <\n"
+    "                 dot(inkColor, vec3(0.2126, 0.7152, 0.0722));\n"
+    "    vec3 illustration = night ? mix(ink, vec3(l), 0.16) : ink;\n"
+    "    tinted = mix(tinted, illustration, color * (night ? 0.72 : 0.75));\n"
     "  }\n"
     "  " SHADER_OUT " = vec4(tinted * brightness, 1.0);\n"
     "}\n";
 
 int main(int argc, char **argv)
 {
+    viewer = (Viewer){0};
     viewer.zoom = 1;
     viewer.brightness = 1;
     viewer.fit_width = true;
     viewer.render_due = -1;
     viewer.save_due = -1;
     SetTraceLogLevel(LOG_WARNING);
+    platform_preinit();
 #if defined(__ANDROID__)
     InitWindow(0, 0, "Folio");
 #elif defined(__EMSCRIPTEN__)
@@ -1959,17 +2259,20 @@ int main(int argc, char **argv)
     viewer.shader = LoadShaderFromMemory(NULL, page_shader);
     viewer.shader_theme = GetShaderLocation(viewer.shader, "readingTheme");
     viewer.shader_brightness = GetShaderLocation(viewer.shader, "brightness");
+    viewer.shader_paper = GetShaderLocation(viewer.shader, "paperColor");
+    viewer.shader_ink = GetShaderLocation(viewer.shader, "inkColor");
 
 #ifdef __EMSCRIPTEN__
     emscripten_set_main_loop(frame, 0, true);
 #else
-    while (!WindowShouldClose()) frame();
+    while (!viewer.quit && !WindowShouldClose()) frame();
     save_reading();
     close_document();
     free(viewer.reading.bookmarks);
     UnloadShader(viewer.shader);
     if (viewer.font.texture.id != GetFontDefault().texture.id) UnloadFont(viewer.font);
-    pdf_close(viewer.locked);
+    worker_close(viewer.opening);
+    platform_remove_temp(&viewer.opening_file);
     platform_shutdown();
     CloseWindow();
 #endif

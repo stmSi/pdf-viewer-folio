@@ -29,24 +29,27 @@ static bool parse_position(const char *text, SavedPosition *position)
     float zoom;
     double x, y;
     if (sscanf(text, "%d %d %f %d %lf %lf", &version, &page, &zoom, &fit, &x, &y) != 6 ||
-        (version != 1 && version != 2) || page < 0 || page == INT_MAX ||
+        (version != 1 && version != 2 && version != 3) || page < 0 || page == INT_MAX ||
         !isfinite(zoom) || !isfinite(x) || !isfinite(y))
         return false;
 
+    int layout=0, rotation=0;
+    if(version==3 && (sscanf(text,"%*d %*d %*f %*d %*lf %*lf %d %d",&layout,&rotation)!=2 ||
+                      layout<0 || layout>2 || rotation<0 || rotation>3)) return false;
     *position = (SavedPosition){
         .location = {page, fmax(0, fmin(1, x)), fmax(-10000, fmin(1, y))},
         .zoom = fmaxf(0.15f, fminf(8.0f, zoom)),
         .fit_width = fit != 0,
-        .version = version
+        .version=version, .layout=layout, .rotation=rotation
     };
     return true;
 }
 
 static int print_position(char *text, size_t size, SavedPosition position)
 {
-    return snprintf(text, size, "2 %d %.6g %d %.9g %.9g\n",
+    return snprintf(text, size, "3 %d %.6g %d %.9g %.9g %d %d\n",
                     position.location.page, position.zoom, position.fit_width,
-                    position.location.x, position.location.y);
+                    position.location.x, position.location.y, position.layout, position.rotation);
 }
 
 bool reading_load_position(uint64_t document, SavedPosition *position)

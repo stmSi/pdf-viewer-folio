@@ -7,9 +7,9 @@ target=${1:-linux}
 jobs=${JOBS:-4}
 
 case "$target" in
-    linux|windows|web|android) ;;
+    linux|macos|windows|web|android) ;;
     *)
-        printf 'Usage: %s linux|windows|web|android\n' "$0" >&2
+        printf 'Usage: %s linux|macos|windows|web|android\n' "$0" >&2
         exit 2
         ;;
 esac
@@ -29,6 +29,11 @@ case "$target" in
     linux)
         ./tools/build-mupdf.sh linux
         build linux
+        ;;
+    macos)
+        ./tools/build-mupdf.sh macos
+        build macos -DCMAKE_OSX_DEPLOYMENT_TARGET=11.0
+        ./tools/package-macos.sh
         ;;
     windows)
         ./tools/build-mupdf.sh windows
@@ -50,7 +55,16 @@ case "$target" in
             printf 'Set ANDROID_HOME to the Android SDK directory.\n' >&2
             exit 1
         fi
-        ndk=${ANDROID_NDK_HOME:-"$sdk/ndk/30.0.16248370"}
+        ndk=${ANDROID_NDK_HOME:-}
+        if [ -z "$ndk" ]; then
+            ndk=$(python3 - "$sdk/ndk" <<'PY'
+import pathlib, sys
+root = pathlib.Path(sys.argv[1])
+installed = [p for p in root.glob('*') if (p / 'build/cmake/android.toolchain.cmake').is_file()]
+print(max(installed, key=lambda p: tuple(int(n) for n in p.name.split('.')), default=''))
+PY
+)
+        fi
         if [ ! -f "$ndk/build/cmake/android.toolchain.cmake" ]; then
             printf 'Android NDK is missing at %s\n' "$ndk" >&2
             exit 1

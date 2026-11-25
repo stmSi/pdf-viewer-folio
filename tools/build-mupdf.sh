@@ -10,6 +10,9 @@ case "$target" in
     linux)
         set -- OS=Linux
         ;;
+    macos)
+        set -- OS=Darwin CC=clang CXX=clang++ AR=ar XCFLAGS=-mmacosx-version-min=11.0
+        ;;
     windows)
         set -- OS=Windows CC=x86_64-w64-mingw32-gcc CXX=x86_64-w64-mingw32-g++ AR=x86_64-w64-mingw32-ar "XCFLAGS=-msse4.1 -D__USE_MINGW_ANSI_STDIO=1"
         ;;
@@ -19,7 +22,12 @@ case "$target" in
     android-*)
         ndk=$2
         triple=$3
-        llvm="$ndk/toolchains/llvm/prebuilt/linux-x86_64/bin"
+        case "$(uname -s)" in
+            Darwin) host=darwin-x86_64 ;;
+            Linux) host=linux-x86_64 ;;
+            *) printf 'Unsupported Android build host\n' >&2; exit 2 ;;
+        esac
+        llvm="$ndk/toolchains/llvm/prebuilt/$host/bin"
         set -- OS=Android CC="$llvm/${triple}29-clang" CXX="$llvm/${triple}29-clang++" AR="$llvm/llvm-ar" XCFLAGS=-fPIC
         ;;
     *)

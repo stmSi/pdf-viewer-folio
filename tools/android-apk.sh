@@ -9,7 +9,12 @@ tools=${ANDROID_BUILD_TOOLS:-"$sdk/build-tools/36.0.0"}
 if [ -n "${ANDROID_JAR:-}" ]; then
     android_jar=$ANDROID_JAR
 else
-    android_jar=$(find "$sdk/platforms" -name android.jar | sort -V | tail -n 1)
+    android_jar=$(python3 - "$sdk/platforms" <<'PY'
+import pathlib, re, sys
+jars = list(pathlib.Path(sys.argv[1]).glob('android-*/android.jar'))
+print(max(jars, key=lambda p: tuple(map(int, re.findall(r'\d+', p.parent.name))), default=''))
+PY
+)
 fi
 if [ ! -f "$android_jar" ] || [ ! -x "$tools/aapt2" ]; then
     printf 'Install an Android SDK platform and build-tools 36.0.0.\n' >&2
@@ -25,9 +30,9 @@ cp .deps/mupdf-1.28.6-source/COPYING "$work/assets/licenses/MuPDF.txt"
 cp .deps/mupdf-1.28.6-source/resources/fonts/noto/COPYING "$work/assets/licenses/Noto.txt"
 cp .deps/raylib-6.2/LICENSE "$work/assets/licenses/raylib.txt"
 javac --release 8 -classpath "$android_jar" -d "$work/classes" \
-    "$root/platform/android/src/org/folio/viewer/ViewerActivity.java"
+    "$root"/platform/android/src/org/folio/viewer/*.java
 "$tools/d8" --lib "$android_jar" --min-api 29 --output "$work/dex" \
-    "$work/classes/org/folio/viewer/ViewerActivity.class"
+    "$work/classes"/org/folio/viewer/*.class
 "$tools/aapt2" link -I "$android_jar" -A "$work/assets" \
     --manifest "$root/platform/android/AndroidManifest.xml" -o "$work/unsigned.apk"
 cp "$work/dex/classes.dex" "$work/classes.dex"

@@ -1,6 +1,10 @@
 #include "platform.h"
+#include "json.h"
+#include "pdf.h"
+#include "text_util.h"
 
 #include <errno.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -9,6 +13,7 @@
 #include <emscripten.h>
 #elif defined(__ANDROID__)
 #include <android_native_app_glue.h>
+#include <EGL/egl.h>
 #include <pthread.h>
 #include <dirent.h>
 #include <sys/stat.h>
@@ -19,6 +24,12 @@
 #include <commdlg.h>
 #include <shellapi.h>
 #include <shlobj.h>
+#elif defined(__APPLE__)
+#include "folio_macos.h"
+#include <pthread.h>
+#include <dirent.h>
+#include <sys/stat.h>
+#include <unistd.h>
 #else
 #include <gio/gio.h>
 #include <dirent.h>
@@ -31,7 +42,7 @@ static TextEvent pending_text;
 static bool file_ready;
 static bool text_ready;
 
-#if defined(__ANDROID__)
+#if defined(__ANDROID__) || (defined(__APPLE__) && !defined(__EMSCRIPTEN__))
 static pthread_mutex_t event_mutex = PTHREAD_MUTEX_INITIALIZER;
 #define LOCK_EVENTS() pthread_mutex_lock(&event_mutex)
 #define UNLOCK_EVENTS() pthread_mutex_unlock(&event_mutex)
@@ -53,16 +64,46 @@ static void queue_file(const char *path, const char *name, const char *error, co
     UNLOCK_EVENTS();
 }
 
-#if defined(__ANDROID__) || defined(__EMSCRIPTEN__)
 static void queue_text(const char *text, bool accepted)
 {
     LOCK_EVENTS();
     pending_text = (TextEvent){.accepted = accepted};
     snprintf(pending_text.value, sizeof pending_text.value, "%s", text);
+    utf8_trim(pending_text.value);
     text_ready = true;
     UNLOCK_EVENTS();
 }
-#endif
+
+void platform_deliver_text(const char *text, bool accepted) { queue_text(text, accepted); }
+void platform_deliver_path(const char *path) { queue_file(path,"","","",false); }
+static char notice_message[320];
+static bool notice_ready;
+void platform_notice(const char *message) {
+    LOCK_EVENTS();snprintf(notice_message,sizeof notice_message,"%s",message);notice_ready=true;UNLOCK_EVENTS();
+}
+bool platform_poll_notice(char *message,size_t size) {
+    LOCK_EVENTS();bool ready=notice_ready;
+    if(ready) {snprintf(message,size,"%s",notice_message);notice_ready=false;}
+    UNLOCK_EVENTS();return ready;
+}
+
+static CommandEvent commands[32];
+static unsigned command_read,command_write;
+void platform_deliver_command(PlatformCommand kind,unsigned element)
+{
+    LOCK_EVENTS();
+    unsigned next=(command_write+1)%32;
+    if(next!=command_read) {commands[command_write]=(CommandEvent){kind,element};command_write=next;}
+    UNLOCK_EVENTS();
+}
+
+bool platform_poll_command(CommandEvent *event)
+{
+    LOCK_EVENTS();
+    bool ready=command_read!=command_write;
+    if(ready) {*event=commands[command_read];command_read=(command_read+1)%32;}
+    UNLOCK_EVENTS();return ready;
+}
 
 bool platform_poll_text(TextEvent *event)
 {
@@ -190,6 +231,45 @@ void platform_list(const char *prefix, StateKeyCallback callback, void *data)
 extern struct android_app *GetAndroidApp(void);
 
 static const char *state_dir;
+static ScrollEvent pending_scroll;
+static bool scroll_ready;
+static int32_t (*android_input)(struct android_app *, AInputEvent *);
+
+static bool activity_call(const char *,const char *,const char *,TextInput);
+static int32_t handle_android_input(struct android_app *app, AInputEvent *event)
+{
+    if(AInputEvent_getType(event)==AINPUT_EVENT_TYPE_MOTION) {
+        int action=AMotionEvent_getAction(event)&AMOTION_EVENT_ACTION_MASK;
+        int source=AInputEvent_getSource(event);
+        if((source&AINPUT_SOURCE_TOUCHSCREEN)==AINPUT_SOURCE_TOUCHSCREEN&&
+           (action==AMOTION_EVENT_ACTION_HOVER_ENTER||action==AMOTION_EVENT_ACTION_HOVER_MOVE||action==AMOTION_EVENT_ACTION_HOVER_EXIT)) {
+            char hover[96];snprintf(hover,sizeof hover,"%.2f,%.2f,%d",AMotionEvent_getX(event,0),AMotionEvent_getY(event,0),action);
+            activity_call("readerHover",hover,NULL,TEXT_GENERAL);
+        }
+    }
+    // raylib's Android backend treats motion events as touch and drops wheel axes.
+    if (AInputEvent_getType(event) == AINPUT_EVENT_TYPE_MOTION &&
+        (AMotionEvent_getAction(event) & AMOTION_EVENT_ACTION_MASK) == AMOTION_EVENT_ACTION_SCROLL) {
+        int width = app->window != NULL ? ANativeWindow_getWidth(app->window) : 0;
+        int height = app->window != NULL ? ANativeWindow_getHeight(app->window) : 0;
+        pending_scroll.x = width > 0 ? AMotionEvent_getX(event, 0) / width : 0;
+        pending_scroll.y = height > 0 ? AMotionEvent_getY(event, 0) / height : 0;
+        pending_scroll.horizontal += AMotionEvent_getAxisValue(event, AMOTION_EVENT_AXIS_HSCROLL, 0);
+        pending_scroll.vertical += AMotionEvent_getAxisValue(event, AMOTION_EVENT_AXIS_VSCROLL, 0);
+        scroll_ready = true;
+        return 1;
+    }
+    return android_input != NULL ? android_input(app, event) : 0;
+}
+
+bool platform_poll_scroll(ScrollEvent *event)
+{
+    bool ready = scroll_ready;
+    *event = pending_scroll;
+    pending_scroll = (ScrollEvent){0};
+    scroll_ready = false;
+    return ready;
+}
 
 static void copy_bytes(JNIEnv *env, jbyteArray source, char *target, size_t size)
 {
@@ -219,6 +299,48 @@ JNIEXPORT void JNICALL Java_org_folio_viewer_ViewerActivity_deliverText(
     char native_text[FOLIO_NAME_MAX];
     copy_bytes(env, value, native_text, sizeof native_text);
     queue_text(native_text, accepted == JNI_TRUE);
+}
+
+JNIEXPORT void JNICALL Java_org_folio_viewer_ViewerActivity_deliverNotice(JNIEnv *env,jclass cls,jbyteArray message)
+{
+    (void)cls;char text[320];copy_bytes(env,message,text,sizeof text);utf8_trim(text);platform_notice(text);
+}
+
+JNIEXPORT void JNICALL Java_org_folio_viewer_ViewerActivity_deliverCommand(
+    JNIEnv *env,jclass cls,jint command,jint element)
+{
+    (void)env;(void)cls;
+    platform_deliver_command((PlatformCommand)command,(unsigned)element);
+}
+
+typedef struct { JNIEnv *env; jobject signal; jmethodID canceled; } PrintCancel;
+static bool print_canceled(void *opaque)
+{
+    PrintCancel *c=opaque;
+    return (*c->env)->CallBooleanMethod(c->env,c->signal,c->canceled)==JNI_TRUE;
+}
+
+JNIEXPORT jbyteArray JNICALL Java_org_folio_viewer_ViewerActivity_writePrintPdf(
+    JNIEnv *env,jclass cls,jbyteArray path,jbyteArray password,jintArray selected,jbyteArray destination,jobject signal)
+{
+    (void)cls;
+    char native_path[FOLIO_PATH_MAX],native_password[1024],native_destination[FOLIO_PATH_MAX],error[256]={0};
+    copy_bytes(env,path,native_path,sizeof native_path);copy_bytes(env,password,native_password,sizeof native_password);
+    copy_bytes(env,destination,native_destination,sizeof native_destination);
+    jsize count=(*env)->GetArrayLength(env,selected);
+    jint *indices=(*env)->GetIntArrayElements(env,selected,NULL);
+    jclass type=(*env)->GetObjectClass(env,signal);
+    PrintCancel cancel={env,signal,(*env)->GetMethodID(env,type,"isCanceled","()Z")};
+    if(indices) {
+        pdf_print_pages(native_path,native_password,(const int *)indices,(size_t)count,native_destination,
+                        print_canceled,&cancel,error,sizeof error);
+        (*env)->ReleaseIntArrayElements(env,selected,indices,JNI_ABORT);
+    } else snprintf(error,sizeof error,"Out of memory preparing print pages.");
+    memset(native_password,0,sizeof native_password);
+    jsize length=(jsize)strlen(error);
+    jbyteArray result=(*env)->NewByteArray(env,length);
+    if(result&&length) (*env)->SetByteArrayRegion(env,result,0,length,(const jbyte *)error);
+    return result;
 }
 
 static jbyteArray java_bytes(JNIEnv *env, const char *text)
@@ -270,9 +392,14 @@ void platform_init(int argc, char **argv)
     (void)argc;
     (void)argv;
     state_dir = GetAndroidApp()->activity->internalDataPath;
+    android_input = GetAndroidApp()->onInputEvent;
+    GetAndroidApp()->onInputEvent = handle_android_input;
 }
 
-void platform_shutdown(void) {}
+void platform_shutdown(void)
+{
+    GetAndroidApp()->onInputEvent = android_input;
+}
 
 void platform_choose_file(void)
 {
@@ -407,6 +534,32 @@ void platform_list(const char *prefix, StateKeyCallback callback, void *data)
     FindClose(handle);
 }
 
+#elif defined(__APPLE__)
+
+static char *state_dir;
+
+void platform_init(int argc, char **argv)
+{
+    state_dir = macos_state_directory();
+    macos_init();
+    if (argc > 1) {
+        if (strlen(argv[1]) < FOLIO_PATH_MAX) queue_file(argv[1], "", "", "", false);
+        else queue_file("", "", "The PDF file path is too long.", "", false);
+    }
+}
+
+void platform_shutdown(void) { free(state_dir); }
+
+void platform_choose_file(void)
+{
+    char path[FOLIO_PATH_MAX];
+    int result = macos_choose_file(path, sizeof path);
+    if (result > 0) queue_file(path, "", "", "", false);
+    else queue_file("", "", result < 0 ? "Could not open the selected PDF." : "", "", false);
+}
+
+const char *platform_pick_hint(void) { return "Choose a file or drop a PDF here"; }
+
 #else
 
 static char *state_dir;
@@ -533,7 +686,11 @@ bool platform_request_text(const char *label, const char *initial, TextInput inp
     (void)label;
     (void)initial;
     (void)input;
+    #if defined(__APPLE__)
+    return macos_request_text(label,initial,input);
+    #else
     return false;
+    #endif
 }
 #endif
 
@@ -603,11 +760,22 @@ bool platform_reopen_file(const char *locator)
     if (MultiByteToWideChar(CP_UTF8, 0, locator, -1, path, FOLIO_PATH_MAX) == 0) return false;
     DWORD attributes = GetFileAttributesW(path);
     if (attributes == INVALID_FILE_ATTRIBUTES || (attributes & FILE_ATTRIBUTE_DIRECTORY)) return false;
+#elif defined(__APPLE__)
+    struct stat attributes;
+    if (stat(locator, &attributes) != 0 || !S_ISREG(attributes.st_mode)) return false;
 #else
     if (!g_file_test(locator, G_FILE_TEST_IS_REGULAR)) return false;
 #endif
     queue_file(locator, "", "", "", false);
     return true;
+}
+#endif
+
+#if !defined(__ANDROID__)
+bool platform_poll_scroll(ScrollEvent *event)
+{
+    (void)event;
+    return false;
 }
 #endif
 
@@ -626,6 +794,12 @@ void platform_file_locator(const FileEvent *event, char *locator, size_t size)
         if (length > 0 && length < FOLIO_PATH_MAX && !utf8(absolute, locator, (int)size))
             locator[0] = '\0';
     }
+#elif defined(__APPLE__)
+    char *absolute = realpath(event->path, NULL);
+    if (absolute != NULL) {
+        if (strlen(absolute) < size) snprintf(locator, size, "%s", absolute);
+        free(absolute);
+    }
 #elif !defined(__ANDROID__) && !defined(__EMSCRIPTEN__)
     char *absolute = g_canonicalize_filename(event->path, NULL);
     if (strlen(absolute) < size) snprintf(locator, size, "%s", absolute);
@@ -635,7 +809,7 @@ void platform_file_locator(const FileEvent *event, char *locator, size_t size)
 
 bool platform_poll_file(FileEvent *event)
 {
-#if !defined(__ANDROID__) && !defined(__EMSCRIPTEN__) && !defined(_WIN32)
+#if !defined(__ANDROID__) && !defined(__EMSCRIPTEN__) && !defined(_WIN32) && !defined(__APPLE__)
     while (g_main_context_iteration(NULL, FALSE)) { }
 #endif
     LOCK_EVENTS();
@@ -649,4 +823,115 @@ bool platform_poll_file(FileEvent *event)
 void platform_remove_temp(const FileEvent *event)
 {
     if (event->temporary && event->path[0] != '\0') remove(event->path);
+}
+
+void platform_preinit(void)
+{
+#if defined(__APPLE__) && !defined(__EMSCRIPTEN__)
+    macos_prepare();
+#endif
+}
+
+bool platform_copy_text(const char *text)
+{
+#if defined(__ANDROID__)
+    return activity_call("copyText",text,NULL,TEXT_GENERAL);
+#elif defined(__APPLE__)
+    return macos_copy_text(text);
+#else
+    extern void SetClipboardText(const char *text);
+    SetClipboardText(text);return true;
+#endif
+}
+
+bool platform_open_link(const char *uri)
+{
+    if(strncmp(uri,"https://",8)&&strncmp(uri,"http://",7)&&strncmp(uri,"mailto:",7)) return false;
+#if defined(__ANDROID__)
+    return activity_call("openLink",uri,NULL,TEXT_GENERAL);
+#elif defined(__APPLE__)
+    return macos_open_link(uri);
+#elif defined(_WIN32)
+    wchar_t target[8192];
+    if(!MultiByteToWideChar(CP_UTF8,0,uri,-1,target,8192)) return false;
+    return (INT_PTR)ShellExecuteW(NULL,L"open",target,NULL,NULL,SW_SHOWNORMAL)>32;
+#elif defined(__EMSCRIPTEN__)
+    EM_ASM({window.open(UTF8ToString($0),"_blank","noopener,noreferrer");},uri);
+    return true;
+#else
+    GError *error=NULL;
+    bool ok=g_app_info_launch_default_for_uri(uri,NULL,&error);
+    if(error) g_error_free(error);
+    return ok;
+#endif
+}
+
+bool platform_document_action(PlatformCommand command,const char *path,const char *title,const char *password,int pages)
+{
+#if defined(__APPLE__) && !defined(__EMSCRIPTEN__)
+    (void)pages;
+    return macos_document_action(command,path,title,password);
+#elif defined(__ANDROID__)
+    Json j={0};json_add(&j,"{\"command\":%d,\"path\":",command);json_string(&j,path);
+    json_add(&j,",\"title\":");json_string(&j,title);
+    json_add(&j,",\"password\":");json_string(&j,password);
+    json_add(&j,",\"pages\":%d}",pages);
+    bool ok=!j.failed&&activity_call("documentAction",j.data,NULL,TEXT_GENERAL);
+    free(j.data);return ok;
+#elif defined(_WIN32)
+    (void)title;(void)password;(void)pages;
+    wchar_t target[FOLIO_PATH_MAX];
+    if(!MultiByteToWideChar(CP_UTF8,0,path,-1,target,FOLIO_PATH_MAX)) return false;
+    if(command==PLATFORM_PRINT) return (INT_PTR)ShellExecuteW(NULL,L"print",target,NULL,NULL,SW_SHOWNORMAL)>32;
+    if(command==PLATFORM_EXPORT) {
+        wchar_t selected[FOLIO_PATH_MAX]=L"Document.pdf";
+        OPENFILENAMEW dialog={0};dialog.lStructSize=sizeof dialog;dialog.hwndOwner=GetForegroundWindow();
+        dialog.lpstrFilter=L"PDF documents\0*.pdf\0";dialog.lpstrFile=selected;dialog.nMaxFile=FOLIO_PATH_MAX;
+        dialog.lpstrDefExt=L"pdf";dialog.Flags=OFN_OVERWRITEPROMPT|OFN_NOCHANGEDIR;
+        return !GetSaveFileNameW(&dialog)||CopyFileW(target,selected,FALSE);
+    }
+    return false;
+#elif defined(__EMSCRIPTEN__)
+    (void)title;(void)password;(void)pages;
+    if(command==PLATFORM_EXPORT||command==PLATFORM_SHARE) {
+        EM_ASM({const bytes=FS.readFile(UTF8ToString($0));const url=URL.createObjectURL(new Blob([bytes],{type:"application/pdf"}));
+            const a=document.createElement("a");a.href=url;a.download="Document.pdf";a.click();setTimeout(()=>URL.revokeObjectURL(url),30000);},path);
+        return true;
+    }
+    return false;
+#else
+    (void)title;(void)password;(void)pages;
+    if(command==PLATFORM_PRINT) {
+        const char *args[]={"lpr",path,NULL};GError *error=NULL;
+        GSubprocess *process=g_subprocess_newv(args,G_SUBPROCESS_FLAGS_NONE,&error);
+        if(error) g_error_free(error);
+        if(process) {g_object_unref(process);return true;}
+    }
+    return false;
+#endif
+}
+
+void platform_accessibility(const char *json)
+{
+    static uint64_t previous;
+    uint64_t hash=UINT64_C(14695981039346656037);
+    for(const unsigned char *p=(const unsigned char *)json;*p;p++) hash=(hash^*p)*UINT64_C(1099511628211);
+    if(hash==previous) return;
+    previous=hash;
+#if defined(__APPLE__) && !defined(__EMSCRIPTEN__)
+    macos_accessibility(json);
+#elif defined(__ANDROID__)
+    activity_call("updateAccessibility",json,NULL,TEXT_GENERAL);
+#else
+    (void)json;
+#endif
+}
+
+bool platform_frame_ready(void)
+{
+#if defined(__ANDROID__)
+    return GetAndroidApp()->window!=NULL&&eglGetCurrentContext()!=EGL_NO_CONTEXT&&eglGetCurrentSurface(EGL_DRAW)!=EGL_NO_SURFACE;
+#else
+    return true;
+#endif
 }

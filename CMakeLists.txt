@@ -23,7 +23,7 @@ elseif(ANDROID)
     set(PLATFORM Android CACHE STRING "" FORCE)
 else()
     set(PLATFORM Desktop CACHE STRING "" FORCE)
-    if(UNIX)
+    if(UNIX AND NOT APPLE)
         set(GLFW_BUILD_X11 ON CACHE BOOL "" FORCE)
         set(GLFW_BUILD_WAYLAND ON CACHE BOOL "" FORCE)
     endif()
@@ -40,16 +40,29 @@ add_custom_command(
     DEPENDS "${FONT_FILE}" "${CMAKE_CURRENT_SOURCE_DIR}/tools/embed-font.py"
     VERBATIM)
 
-set(FOLIO_SOURCES src/main.c src/pdf.c src/platform.c src/reading_state.c "${EMBEDDED_FONT}")
+set(FOLIO_SOURCES src/main.c src/pdf.c src/pdf_worker.c src/platform.c src/reading_state.c "${EMBEDDED_FONT}")
 if(ANDROID)
     add_library(folio SHARED ${FOLIO_SOURCES})
+elseif(APPLE)
+    enable_language(OBJC)
+    set_source_files_properties(platform/macos/native.m PROPERTIES COMPILE_OPTIONS "-fobjc-arc")
+    add_executable(folio MACOSX_BUNDLE ${FOLIO_SOURCES} platform/macos/native.m)
+    set_target_properties(folio PROPERTIES
+        OUTPUT_NAME Folio
+        MACOSX_BUNDLE_INFO_PLIST "${CMAKE_CURRENT_SOURCE_DIR}/platform/macos/Info.plist.in"
+        MACOSX_BUNDLE_BUNDLE_NAME Folio
+        MACOSX_BUNDLE_GUI_IDENTIFIER org.folio.viewer
+        MACOSX_BUNDLE_SHORT_VERSION_STRING ${PROJECT_VERSION}
+        MACOSX_BUNDLE_BUNDLE_VERSION ${PROJECT_VERSION})
+    target_include_directories(folio PRIVATE platform/macos)
 else()
     add_executable(folio ${FOLIO_SOURCES})
 endif()
 
 target_include_directories(folio SYSTEM PRIVATE "${MUPDF_DIR}/include")
 target_compile_features(folio PRIVATE c_std_11)
-target_link_libraries(folio PRIVATE raylib
+find_package(Threads REQUIRED)
+target_link_libraries(folio PRIVATE Threads::Threads raylib
     "${MUPDF_BUILD_DIR}/libmupdf.a" "${MUPDF_BUILD_DIR}/libmupdf-third.a")
 if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
     target_compile_options(folio PRIVATE -Wall -Wextra -Wpedantic)
@@ -77,8 +90,30 @@ elseif(WIN32)
     if(MINGW)
         target_link_options(folio PRIVATE -static -mwindows)
     endif()
+elseif(APPLE)
+    target_link_libraries(folio PRIVATE "-framework Cocoa" "-framework UniformTypeIdentifiers" "-framework PDFKit" "-framework Carbon")
 else()
     find_package(PkgConfig REQUIRED)
     pkg_check_modules(GIO REQUIRED IMPORTED_TARGET gio-2.0)
     target_link_libraries(folio PRIVATE PkgConfig::GIO)
+endif()
+
+option(FOLIO_BUILD_TESTS "Build native PDF engine and worker regression checks" OFF)
+if(FOLIO_BUILD_TESTS AND NOT ANDROID AND NOT EMSCRIPTEN)
+    enable_testing()
+    add_custom_command(OUTPUT "${CMAKE_BINARY_DIR}/test-data/features.pdf"
+        COMMAND "${Python3_EXECUTABLE}" "${CMAKE_SOURCE_DIR}/tests/make-fixtures.py" "${CMAKE_BINARY_DIR}/test-data"
+        DEPENDS tests/make-fixtures.py VERBATIM)
+    add_custom_target(folio_test_fixtures DEPENDS "${CMAKE_BINARY_DIR}/test-data/features.pdf")
+    add_executable(folio_core_tests tests/pdf_features.c src/pdf.c src/pdf_worker.c src/reading_state.c)
+    target_include_directories(folio_core_tests PRIVATE src)
+    target_include_directories(folio_core_tests SYSTEM PRIVATE "${MUPDF_DIR}/include")
+    target_compile_features(folio_core_tests PRIVATE c_std_11)
+    target_link_libraries(folio_core_tests PRIVATE Threads::Threads
+        "${MUPDF_BUILD_DIR}/libmupdf.a" "${MUPDF_BUILD_DIR}/libmupdf-third.a")
+    if(UNIX)
+        target_link_libraries(folio_core_tests PRIVATE m)
+    endif()
+    add_dependencies(folio_core_tests folio_test_fixtures)
+    add_test(NAME pdf_core COMMAND folio_core_tests "${CMAKE_BINARY_DIR}/test-data")
 endif()
